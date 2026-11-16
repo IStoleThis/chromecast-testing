@@ -17,6 +17,10 @@ import 'package:mangayomi/modules/anime/mixins/anime_mpv_bridge_mixin.dart';
 import 'package:mangayomi/modules/anime/mixins/anime_player_controls_mixin.dart';
 import 'package:mangayomi/modules/anime/mixins/anime_player_settings_mixin.dart';
 import 'package:mangayomi/modules/anime/mixins/anime_track_selection_mixin.dart';
+import 'package:dart_cast/dart_cast.dart' show CastDevice, CastMedia;
+import 'package:mangayomi/modules/anime/cast/cast_controller.dart';
+import 'package:mangayomi/modules/anime/cast/cast_media_builder.dart';
+import 'package:mangayomi/modules/anime/cast/cast_sheet.dart';
 import 'package:mangayomi/modules/anime/providers/anime_player_controller_provider.dart';
 import 'package:mangayomi/modules/anime/providers/auto_play_next_provider.dart';
 import 'package:mangayomi/modules/anime/utils/playback_media.dart';
@@ -273,6 +277,10 @@ class _AnimeStreamPageState extends riv.ConsumerState<AnimeStreamPage>
   @override
   VoidCallback get controlsOpenTvSettingsPanel =>
       () => setState(() => _tvSettingsOpen = true);
+  @override
+  CastController get controlsCast => _cast;
+  @override
+  VoidCallback get controlsOpenCastSheet => _openCastSheet;
   @override
   Player get mpvBridgePlayer => _player;
   @override
@@ -741,6 +749,7 @@ class _AnimeStreamPageState extends riv.ConsumerState<AnimeStreamPage>
     _completed;
     // ignore: unnecessary_statements
     _currentTotalDurationSub;
+    _initCast();
     loadAndroidFont().then((_) {
       if (!mounted) return;
       _openMedia(_video.value!, _streamController.getCurrentPosition());
@@ -782,9 +791,126 @@ class _AnimeStreamPageState extends riv.ConsumerState<AnimeStreamPage>
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Chromecast
+  // ---------------------------------------------------------------------------
+
+  final CastController _cast = CastController.instance;
+  StreamSubscription<void>? _castFinishedSub;
+  StreamSubscription<bool>? _castLocalPlayingSub;
+  bool _wasCasting = false;
+
+  void _initCast() {
+    _cast.attach();
+    _wasCasting = _cast.isCasting;
+    _cast.addListener(_onCastChanged);
+    _cast.position.addListener(_onCastPosition);
+    _cast.duration.addListener(_onCastDuration);
+    // The TV played the episode to its end: same handling as the local
+    // player, which marks it watched and rolls on to the next episode.
+    _castFinishedSub = _cast.onFinished.listen(
+      (_) => _handlePlaybackCompleted(true),
+    );
+    // While casting, the phone stays silent. Pressing play on its own controls
+    // plays or pauses the TV instead of starting a second copy locally.
+    _castLocalPlayingSub = _player.stream.playing.listen((playing) {
+      if (playing && _cast.isCasting) {
+        unawaited(_player.pause());
+        unawaited(_cast.togglePlayPause());
+      }
+    });
+  }
+
+  void _disposeCast() {
+    _cast.removeListener(_onCastChanged);
+    _cast.position.removeListener(_onCastPosition);
+    _cast.duration.removeListener(_onCastDuration);
+    _castFinishedSub?.cancel();
+    _castLocalPlayingSub?.cancel();
+    _castFinishedSub = null;
+    _castLocalPlayingSub = null;
+    // Leaves the session open briefly so the next episode's player can take
+    // it over; it ends on its own if no player picks it up.
+    _cast.detach();
+  }
+
+  // Progress and history follow the TV while casting.
+  void _onCastPosition() {
+    if (_cast.isCasting) _currentPosition.value = _cast.position.value;
+  }
+
+  void _onCastDuration() {
+    final total = _cast.duration.value;
+    if (_cast.isCasting && total > Duration.zero) {
+      _currentTotalDuration.value = total;
+    }
+  }
+
+  void _onCastChanged() {
+    final casting = _cast.isCasting;
+    if (_wasCasting && !casting && mounted) {
+      // Casting ended (stopped here, or the TV dropped it): the phone picks
+      // up where the TV left off, paused, so nothing starts playing by surprise.
+      final resumeAt = _cast.position.value;
+      _currentPosition.value = resumeAt;
+      unawaited(_player.seek(resumeAt));
+    }
+    _wasCasting = casting;
+  }
+
+  void _openCastSheet() {
+    showCastSheet(
+      context,
+      controller: _cast,
+      onDeviceSelected: (device) => unawaited(_castTo(device)),
+      onStopCasting: () => unawaited(_cast.end()),
+    );
+  }
+
+  Future<void> _castTo(CastDevice device) async {
+    final prefs = _video.value;
+    if (prefs?.videoTrack == null) return;
+    final wasPlaying = _player.state.playing;
+    await _player.pause();
+    final started = await _cast.start(
+      device,
+      () => _castMediaFor(prefs!, _currentPosition.value),
+    );
+    if (!started && wasPlaying && mounted) await _player.play();
+  }
+
+  Future<CastMedia> _castMediaFor(VideoPrefs prefs, Duration start) {
+    final id = prefs.videoTrack!.id;
+    final video = widget.videos.firstWhere(
+      (v) => (widget.isLocal ? v.originalUrl : v.url) == id,
+      orElse: () => _firstVid,
+    );
+    final series = widget.episode.manga.value?.name;
+    final episodeName = widget.episode.name;
+    return buildCastMedia(
+      url: id,
+      isLocal: widget.isLocal,
+      headers: prefs.headers,
+      title: [?series, ?episodeName].join(' - '),
+      start: start,
+      subtitles: video.subtitles,
+    );
+  }
+
+  /// Puts what the player now has (a new episode, another quality) onto the
+  /// TV that is already connected.
+  Future<void> _castLoad(VideoPrefs prefs, Duration start) async {
+    try {
+      final media = await _castMediaFor(prefs, start);
+      if (!mounted || !_cast.isCasting) return;
+      await _cast.load(media);
+    } catch (_) {}
+  }
+
   Future<void> _openMedia(VideoPrefs prefs, [Duration? position]) async {
     final start = position ?? _currentPosition.value;
     resetAudioFallbackState(resetRequestedLanguage: true);
+    final casting = _cast.isCasting;
     await _player.open(
       playbackMedia(
         prefs.videoTrack!.id,
@@ -792,7 +918,9 @@ class _AnimeStreamPageState extends riv.ConsumerState<AnimeStreamPage>
         httpHeaders: prefs.headers,
         start: start,
       ),
+      play: !casting,
     );
+    if (casting) unawaited(_castLoad(prefs, start));
     if (start > Duration.zero) {
       unawaited(
         _player.stream.duration
@@ -852,6 +980,7 @@ class _AnimeStreamPageState extends riv.ConsumerState<AnimeStreamPage>
     _tvVideoFocus.dispose();
     _tvPanelFocus.dispose();
     _watchStopwatch.stop();
+    _disposeCast();
     _currentPosition.removeListener(_updateRpcTimestamp);
     _subDelayController.removeListener(onSubDelayChanged);
     _audioDelayController.removeListener(onAudioDelayChanged);

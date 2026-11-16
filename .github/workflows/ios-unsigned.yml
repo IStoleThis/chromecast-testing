@@ -1,0 +1,61 @@
+name: Build unsigned iOS IPA
+
+# Builds an iOS app without code signing, for sideloading with a tool such as
+# AltStore or Sideloadly, which sign it with your own Apple ID on install.
+# (The official release workflow signs with the maintainer's certificate, which
+# a fork doesn't have.) Run it from the repository's Actions tab, then download
+# the "Mangayomi-ios-unsigned" artifact from the finished run.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ios-ipa:
+    runs-on: macos-26
+    env:
+      # Same pin as the release workflow: newer Rust versions currently crash
+      # the Xcode linker on the release build.
+      CARGOKIT_TOOLCHAIN: "1.99.1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2.23.0
+        with:
+          channel: "stable"
+          architecture: x64
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.CARGOKIT_TOOLCHAIN }}
+          targets: aarch64-apple-ios,x86_64-apple-ios
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: rust
+          cache-on-failure: true
+
+      - name: Print Xcode version
+        run: xcodebuild -version
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build iOS (no code signing)
+        run: |
+          flutter build ios --release --no-codesign
+          mkdir -p build/ios/iphoneos/Payload
+          mv build/ios/iphoneos/Runner.app build/ios/iphoneos/Payload/
+          cd build/ios/iphoneos
+          zip -r Mangayomi-ios-unsigned.ipa Payload
+
+      - name: Upload artifact iOS IPA
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: Mangayomi-ios-unsigned
+          path: "build/ios/iphoneos/Mangayomi-ios-unsigned.ipa"

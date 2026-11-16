@@ -1,0 +1,1284 @@
+diff --git a/.github/workflows/actions.lock b/.github/workflows/actions.lock
+index f295344..4b5efc0 100644
+--- a/.github/workflows/actions.lock
++++ b/.github/workflows/actions.lock
+@@ -9,6 +9,12 @@ workflows:
+         - 'actions/upload-artifact@v4.6.2'
+         - 'dtolnay/rust-toolchain@master'
+         - 'subosito/flutter-action@v2.23.0'
++    '.github/workflows/ios-unsigned.yml':
++        - 'actions/checkout@v4.4.0'
++        - 'actions/upload-artifact@v4.6.2'
++        - 'dtolnay/rust-toolchain@master'
++        - 'subosito/flutter-action@v2.23.0'
++        - 'swatinem/rust-cache@v2.9.3'
+     '.github/workflows/release.yml':
+         - 'actions/checkout@v4.4.0'
+         - 'actions/download-artifact@v4.3.0'
+diff --git a/.github/workflows/ios-unsigned.yml b/.github/workflows/ios-unsigned.yml
+new file mode 100644
+index 0000000..616bae0
+--- /dev/null
++++ b/.github/workflows/ios-unsigned.yml
+@@ -0,0 +1,61 @@
++name: Build unsigned iOS IPA
++
++# Builds an iOS app without code signing, for sideloading with a tool such as
++# AltStore or Sideloadly, which sign it with your own Apple ID on install.
++# (The official release workflow signs with the maintainer's certificate, which
++# a fork doesn't have.) Run it from the repository's Actions tab, then download
++# the "Mangayomi-ios-unsigned" artifact from the finished run.
++
++on:
++  workflow_dispatch:
++
++jobs:
++  build-ios-ipa:
++    runs-on: macos-26
++    env:
++      # Same pin as the release workflow: newer Rust versions currently crash
++      # the Xcode linker on the release build.
++      CARGOKIT_TOOLCHAIN: "1.99.1"
++    steps:
++      - name: Checkout repository
++        uses: actions/checkout@v4.4.0
++        with:
++          persist-credentials: false
++
++      - name: Setup Flutter
++        uses: subosito/flutter-action@v2.23.0
++        with:
++          channel: "stable"
++          architecture: x64
++
++      - name: Setup Rust toolchain
++        uses: dtolnay/rust-toolchain@master
++        with:
++          toolchain: ${{ env.CARGOKIT_TOOLCHAIN }}
++          targets: aarch64-apple-ios,x86_64-apple-ios
++
++      - name: Setup Rust cache
++        uses: Swatinem/rust-cache@v2.9.3
++        with:
++          workspaces: rust
++          cache-on-failure: true
++
++      - name: Print Xcode version
++        run: xcodebuild -version
++
++      - name: Flutter pub get
++        run: flutter pub get
++
++      - name: Build iOS (no code signing)
++        run: |
++          flutter build ios --release --no-codesign
++          mkdir -p build/ios/iphoneos/Payload
++          mv build/ios/iphoneos/Runner.app build/ios/iphoneos/Payload/
++          cd build/ios/iphoneos
++          zip -r Mangayomi-ios-unsigned.ipa Payload
++
++      - name: Upload artifact iOS IPA
++        uses: actions/upload-artifact@v4.6.2
++        with:
++          name: Mangayomi-ios-unsigned
++          path: "build/ios/iphoneos/Mangayomi-ios-unsigned.ipa"
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index 536c35d..dd7963d 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -1,6 +1,13 @@
+ <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+     package="com.kodjodevf.mangayomi">
+     <uses-permission android:name="android.permission.INTERNET" />
++    <!-- Chromecast: finding TVs on the local network. -->
++    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
++    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
++    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
++    <uses-permission
++        android:name="android.permission.NEARBY_WIFI_DEVICES"
++        android:usesPermissionFlags="neverForLocation" />
+     <uses-permission android:name="android.permission.USE_BIOMETRIC"/>
+     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+diff --git a/ios/Runner/Info.plist b/ios/Runner/Info.plist
+index 0e0df4b..c922b71 100644
+--- a/ios/Runner/Info.plist
++++ b/ios/Runner/Info.plist
+@@ -5,7 +5,11 @@
+ 	<key>NSCameraUsageDescription</key>
+ 	<string>Scans the QR code another of your devices shows, to sync with it.</string>
+ 	<key>NSLocalNetworkUsageDescription</key>
+-	<string>Finds your other devices on this network so they can sync with each other.</string>
++	<string>Finds your other devices on this network so they can sync with each other, and finds TVs you can cast to.</string>
++	<key>NSBonjourServices</key>
++	<array>
++		<string>_googlecast._tcp</string>
++	</array>
+ 	<key>NSAppTransportSecurity</key>
+ 	<dict>
+ 		<key>NSAllowsArbitraryLoads</key>
+diff --git a/lib/modules/anime/anime_player_view.dart b/lib/modules/anime/anime_player_view.dart
+index eee4806..e2d39d3 100644
+--- a/lib/modules/anime/anime_player_view.dart
++++ b/lib/modules/anime/anime_player_view.dart
+@@ -17,6 +17,10 @@ import 'package:mangayomi/modules/anime/mixins/anime_mpv_bridge_mixin.dart';
+ import 'package:mangayomi/modules/anime/mixins/anime_player_controls_mixin.dart';
+ import 'package:mangayomi/modules/anime/mixins/anime_player_settings_mixin.dart';
+ import 'package:mangayomi/modules/anime/mixins/anime_track_selection_mixin.dart';
++import 'package:dart_cast/dart_cast.dart' show CastDevice, CastMedia;
++import 'package:mangayomi/modules/anime/cast/cast_controller.dart';
++import 'package:mangayomi/modules/anime/cast/cast_media_builder.dart';
++import 'package:mangayomi/modules/anime/cast/cast_sheet.dart';
+ import 'package:mangayomi/modules/anime/providers/anime_player_controller_provider.dart';
+ import 'package:mangayomi/modules/anime/providers/auto_play_next_provider.dart';
+ import 'package:mangayomi/modules/anime/utils/playback_media.dart';
+@@ -274,6 +278,10 @@ class _AnimeStreamPageState extends riv.ConsumerState<AnimeStreamPage>
+   VoidCallback get controlsOpenTvSettingsPanel =>
+       () => setState(() => _tvSettingsOpen = true);
+   @override
++  CastController get controlsCast => _cast;
++  @override
++  VoidCallback get controlsOpenCastSheet => _openCastSheet;
++  @override
+   Player get mpvBridgePlayer => _player;
+   @override
+   bool get mpvUseLibass => useLibass;
+@@ -741,6 +749,7 @@ class _AnimeStreamPageState extends riv.ConsumerState<AnimeStreamPage>
+     _completed;
+     // ignore: unnecessary_statements
+     _currentTotalDurationSub;
++    _initCast();
+     loadAndroidFont().then((_) {
+       if (!mounted) return;
+       _openMedia(_video.value!, _streamController.getCurrentPosition());
+@@ -782,9 +791,126 @@ class _AnimeStreamPageState extends riv.ConsumerState<AnimeStreamPage>
+     }
+   }
+ 
++  // ---------------------------------------------------------------------------
++  // Chromecast
++  // ---------------------------------------------------------------------------
++
++  final CastController _cast = CastController.instance;
++  StreamSubscription<void>? _castFinishedSub;
++  StreamSubscription<bool>? _castLocalPlayingSub;
++  bool _wasCasting = false;
++
++  void _initCast() {
++    _cast.attach();
++    _wasCasting = _cast.isCasting;
++    _cast.addListener(_onCastChanged);
++    _cast.position.addListener(_onCastPosition);
++    _cast.duration.addListener(_onCastDuration);
++    // The TV played the episode to its end: same handling as the local
++    // player, which marks it watched and rolls on to the next episode.
++    _castFinishedSub = _cast.onFinished.listen(
++      (_) => _handlePlaybackCompleted(true),
++    );
++    // While casting, the phone stays silent. Pressing play on its own controls
++    // plays or pauses the TV instead of starting a second copy locally.
++    _castLocalPlayingSub = _player.stream.playing.listen((playing) {
++      if (playing && _cast.isCasting) {
++        unawaited(_player.pause());
++        unawaited(_cast.togglePlayPause());
++      }
++    });
++  }
++
++  void _disposeCast() {
++    _cast.removeListener(_onCastChanged);
++    _cast.position.removeListener(_onCastPosition);
++    _cast.duration.removeListener(_onCastDuration);
++    _castFinishedSub?.cancel();
++    _castLocalPlayingSub?.cancel();
++    _castFinishedSub = null;
++    _castLocalPlayingSub = null;
++    // Leaves the session open briefly so the next episode's player can take
++    // it over; it ends on its own if no player picks it up.
++    _cast.detach();
++  }
++
++  // Progress and history follow the TV while casting.
++  void _onCastPosition() {
++    if (_cast.isCasting) _currentPosition.value = _cast.position.value;
++  }
++
++  void _onCastDuration() {
++    final total = _cast.duration.value;
++    if (_cast.isCasting && total > Duration.zero) {
++      _currentTotalDuration.value = total;
++    }
++  }
++
++  void _onCastChanged() {
++    final casting = _cast.isCasting;
++    if (_wasCasting && !casting && mounted) {
++      // Casting ended (stopped here, or the TV dropped it): the phone picks
++      // up where the TV left off, paused, so nothing starts playing by surprise.
++      final resumeAt = _cast.position.value;
++      _currentPosition.value = resumeAt;
++      unawaited(_player.seek(resumeAt));
++    }
++    _wasCasting = casting;
++  }
++
++  void _openCastSheet() {
++    showCastSheet(
++      context,
++      controller: _cast,
++      onDeviceSelected: (device) => unawaited(_castTo(device)),
++      onStopCasting: () => unawaited(_cast.end()),
++    );
++  }
++
++  Future<void> _castTo(CastDevice device) async {
++    final prefs = _video.value;
++    if (prefs?.videoTrack == null) return;
++    final wasPlaying = _player.state.playing;
++    await _player.pause();
++    final started = await _cast.start(
++      device,
++      () => _castMediaFor(prefs!, _currentPosition.value),
++    );
++    if (!started && wasPlaying && mounted) await _player.play();
++  }
++
++  Future<CastMedia> _castMediaFor(VideoPrefs prefs, Duration start) {
++    final id = prefs.videoTrack!.id;
++    final video = widget.videos.firstWhere(
++      (v) => (widget.isLocal ? v.originalUrl : v.url) == id,
++      orElse: () => _firstVid,
++    );
++    final series = widget.episode.manga.value?.name;
++    final episodeName = widget.episode.name;
++    return buildCastMedia(
++      url: id,
++      isLocal: widget.isLocal,
++      headers: prefs.headers,
++      title: [?series, ?episodeName].join(' - '),
++      start: start,
++      subtitles: video.subtitles,
++    );
++  }
++
++  /// Puts what the player now has (a new episode, another quality) onto the
++  /// TV that is already connected.
++  Future<void> _castLoad(VideoPrefs prefs, Duration start) async {
++    try {
++      final media = await _castMediaFor(prefs, start);
++      if (!mounted || !_cast.isCasting) return;
++      await _cast.load(media);
++    } catch (_) {}
++  }
++
+   Future<void> _openMedia(VideoPrefs prefs, [Duration? position]) async {
+     final start = position ?? _currentPosition.value;
+     resetAudioFallbackState(resetRequestedLanguage: true);
++    final casting = _cast.isCasting;
+     await _player.open(
+       playbackMedia(
+         prefs.videoTrack!.id,
+@@ -792,7 +918,9 @@ class _AnimeStreamPageState extends riv.ConsumerState<AnimeStreamPage>
+         httpHeaders: prefs.headers,
+         start: start,
+       ),
++      play: !casting,
+     );
++    if (casting) unawaited(_castLoad(prefs, start));
+     if (start > Duration.zero) {
+       unawaited(
+         _player.stream.duration
+@@ -852,6 +980,7 @@ class _AnimeStreamPageState extends riv.ConsumerState<AnimeStreamPage>
+     _tvVideoFocus.dispose();
+     _tvPanelFocus.dispose();
+     _watchStopwatch.stop();
++    _disposeCast();
+     _currentPosition.removeListener(_updateRpcTimestamp);
+     _subDelayController.removeListener(onSubDelayChanged);
+     _audioDelayController.removeListener(onAudioDelayChanged);
+diff --git a/lib/modules/anime/cast/cast_controller.dart b/lib/modules/anime/cast/cast_controller.dart
+new file mode 100644
+index 0000000..fb94963
+--- /dev/null
++++ b/lib/modules/anime/cast/cast_controller.dart
+@@ -0,0 +1,348 @@
++import 'dart:async';
++
++import 'package:dart_cast/dart_cast.dart';
++import 'package:flutter/foundation.dart';
++import 'package:wakelock_plus/wakelock_plus.dart';
++
++import 'cast_discovery.dart';
++
++enum CastStatus { idle, searching, connecting, casting }
++
++/// App-wide Chromecast state.
++///
++/// It is a singleton so a cast session outlives a single player screen: when
++/// "play next episode" replaces the player, the new screen finds the session
++/// still open and loads the next episode onto the same TV.
++///
++/// Playback position and duration are separate [ValueNotifier]s because they
++/// tick every second, and most listeners only care about the structural state
++/// (device list, connecting, casting, errors) that [notifyListeners] reports.
++class CastController extends ChangeNotifier {
++  CastController._();
++
++  static final CastController instance = CastController._();
++
++  late final CastService _service = CastService(
++    discoveryProviders: [
++      ChromecastDiscoveryProvider(
++        mdnsLookup: useNativeDiscovery ? bonsoirLookup : null,
++      ),
++    ],
++    sessionFactory: (device) => ChromecastSession(device: device),
++  );
++
++  /// Where the TV is in the media, while casting.
++  final ValueNotifier<Duration> position = ValueNotifier(Duration.zero);
++
++  /// How long the media on the TV is, once the receiver has reported it.
++  final ValueNotifier<Duration> duration = ValueNotifier(Duration.zero);
++
++  final StreamController<void> _finished = StreamController<void>.broadcast();
++
++  /// Fires when the media on the TV plays through to its end.
++  Stream<void> get onFinished => _finished.stream;
++
++  CastStatus _status = CastStatus.idle;
++  List<CastDevice> _devices = const [];
++  CastDevice? _device;
++  CastSession? _session;
++  SessionState _sessionState = SessionState.disconnected;
++  double? _volume;
++  String? _error;
++  Duration _lastLivePosition = Duration.zero;
++
++  StreamSubscription<List<CastDevice>>? _discoverySub;
++  Timer? _searchTimer;
++  final List<StreamSubscription<dynamic>> _sessionSubs = [];
++
++  int _attachedViews = 0;
++  Timer? _orphanTimer;
++
++  CastStatus get status => _status;
++  bool get isCasting => _status == CastStatus.casting;
++  bool get isBusy =>
++      _status == CastStatus.connecting || _status == CastStatus.casting;
++  List<CastDevice> get devices => _devices;
++  CastDevice? get device => _device;
++  double? get volume => _volume;
++  String? get error => _error;
++  bool get isPlaying =>
++      _sessionState == SessionState.playing ||
++      _sessionState == SessionState.buffering ||
++      _sessionState == SessionState.loading;
++
++  // ---------------------------------------------------------------------------
++  // Player screens come and go; the session is dropped once none is left.
++  // ---------------------------------------------------------------------------
++
++  /// A player screen started using the controller.
++  void attach() {
++    _attachedViews++;
++    _orphanTimer?.cancel();
++    _orphanTimer = null;
++  }
++
++  /// A player screen is done. If it was the last one and a session is open,
++  /// the session ends after a short grace period, which lets the next
++  /// episode's screen take it over instead.
++  void detach() {
++    if (_attachedViews > 0) _attachedViews--;
++    if (_attachedViews > 0) return;
++    if (_session == null) {
++      _stopSearching();
++      return;
++    }
++    _orphanTimer?.cancel();
++    _orphanTimer = Timer(const Duration(seconds: 6), () {
++      if (_attachedViews == 0) unawaited(end());
++    });
++  }
++
++  // ---------------------------------------------------------------------------
++  // Discovery
++  // ---------------------------------------------------------------------------
++
++  /// Looks for Chromecasts on the local network for a few seconds.
++  Future<void> discover() async {
++    if (isBusy) return;
++    await _discoverySub?.cancel();
++    _discoverySub = null;
++    _searchTimer?.cancel();
++
++    _devices = const [];
++    _error = null;
++    _status = CastStatus.searching;
++    notifyListeners();
++
++    const timeout = Duration(seconds: 8);
++    try {
++      _discoverySub = _service
++          .startDiscovery(
++            protocols: {CastProtocol.chromecast},
++            timeout: timeout,
++          )
++          .listen(
++            (found) {
++              _devices = [...found]
++                ..sort(
++                  (a, b) =>
++                      a.name.toLowerCase().compareTo(b.name.toLowerCase()),
++                );
++              notifyListeners();
++            },
++            onError: (Object error) {
++              _error = 'Could not search for devices: $error';
++              _endSearch();
++            },
++            onDone: _endSearch,
++          );
++      // Discovery should close itself at the timeout; this is the backstop.
++      _searchTimer = Timer(timeout + const Duration(seconds: 2), _endSearch);
++    } catch (error) {
++      _error = 'Could not search for devices: $error';
++      _endSearch();
++    }
++  }
++
++  void _endSearch() {
++    _searchTimer?.cancel();
++    _searchTimer = null;
++    if (_status == CastStatus.searching) {
++      _status = CastStatus.idle;
++      notifyListeners();
++    }
++  }
++
++  void _stopSearching() {
++    unawaited(_discoverySub?.cancel());
++    _discoverySub = null;
++    _service.stopDiscovery();
++    _endSearch();
++  }
++
++  // ---------------------------------------------------------------------------
++  // Session
++  // ---------------------------------------------------------------------------
++
++  /// Connects to [device] and starts the media [buildMedia] returns on it.
++  /// Returns whether it worked; on failure [error] says why.
++  ///
++  /// The media is built once connected so the "connecting" state shows while
++  /// the stream is being inspected, which can take a few seconds.
++  Future<bool> start(
++    CastDevice device,
++    Future<CastMedia> Function() buildMedia,
++  ) async {
++    _orphanTimer?.cancel();
++    _stopSearching();
++
++    _error = null;
++    _device = device;
++    _status = CastStatus.connecting;
++    notifyListeners();
++
++    try {
++      final session = await _service.connect(device);
++      _bind(session);
++      final media = await buildMedia();
++      _resetProgress(media);
++      await session.loadMedia(media);
++      _status = CastStatus.casting;
++      unawaited(WakelockPlus.enable());
++      notifyListeners();
++      return true;
++    } catch (error) {
++      await _abort('Could not cast to ${device.name}: $error');
++      return false;
++    }
++  }
++
++  /// Switches the TV to [media] on the open session, e.g. for the next
++  /// episode or another quality.
++  Future<bool> load(CastMedia media) async {
++    final session = _session;
++    if (session == null) return false;
++    try {
++      _resetProgress(media);
++      await session.loadMedia(media);
++      _error = null;
++      notifyListeners();
++      return true;
++    } catch (error) {
++      _error = 'The TV could not play this: $error';
++      notifyListeners();
++      return false;
++    }
++  }
++
++  Future<void> play() => _command((s) => s.play());
++
++  Future<void> pause() => _command((s) => s.pause());
++
++  Future<void> togglePlayPause() => isPlaying ? pause() : play();
++
++  Future<void> seek(Duration to) async {
++    final total = duration.value;
++    var target = to < Duration.zero ? Duration.zero : to;
++    if (total > Duration.zero && target > total) target = total;
++    position.value = target;
++    await _command((s) => s.seek(target));
++  }
++
++  Future<void> seekBy(Duration delta) => seek(position.value + delta);
++
++  Future<void> setVolume(double value) {
++    final volume = value.clamp(0.0, 1.0).toDouble();
++    _volume = volume;
++    notifyListeners();
++    return _command((s) => s.setVolume(volume));
++  }
++
++  /// Stops what is playing on the TV and disconnects from it.
++  Future<void> end() async {
++    final session = _session;
++    await _release();
++    if (session == null) return;
++    try {
++      await session.stop();
++    } catch (_) {}
++    try {
++      await session.disconnect();
++    } catch (_) {}
++  }
++
++  // ---------------------------------------------------------------------------
++  // Internals
++  // ---------------------------------------------------------------------------
++
++  void _bind(CastSession session) {
++    _session = session;
++    _sessionState = session.state;
++    _volume = session.volume;
++    _sessionSubs
++      ..add(session.stateStream.listen(_onSessionState))
++      ..add(
++        session.positionStream.listen((value) {
++          position.value = value;
++          if (_sessionState == SessionState.playing) _lastLivePosition = value;
++        }),
++      )
++      ..add(session.durationStream.listen((value) => duration.value = value))
++      ..add(
++        session.volumeStream.listen((value) {
++          _volume = value;
++          notifyListeners();
++        }),
++      );
++  }
++
++  void _resetProgress(CastMedia media) {
++    position.value = media.startPosition ?? Duration.zero;
++    duration.value = Duration.zero;
++    _lastLivePosition = position.value;
++  }
++
++  void _onSessionState(SessionState next) {
++    final previous = _sessionState;
++    _sessionState = next;
++
++    if (next == SessionState.disconnected) {
++      // The TV (or the network) ended the session.
++      if (_session != null) unawaited(_release());
++      return;
++    }
++
++    final wasPlaying =
++        previous == SessionState.playing ||
++        previous == SessionState.buffering ||
++        previous == SessionState.paused;
++    if (next == SessionState.idle &&
++        wasPlaying &&
++        _status == CastStatus.casting &&
++        _endedNearTheEnd()) {
++      _finished.add(null);
++    }
++    notifyListeners();
++  }
++
++  bool _endedNearTheEnd() {
++    final total = duration.value;
++    return total > Duration.zero &&
++        _lastLivePosition >= total - const Duration(seconds: 15);
++  }
++
++  Future<void> _command(Future<void> Function(CastSession session) run) async {
++    final session = _session;
++    if (session == null) return;
++    try {
++      await run(session);
++    } catch (error) {
++      _error = 'The TV did not respond: $error';
++      notifyListeners();
++    }
++  }
++
++  /// Gives up on a session that failed to start, remembering [message].
++  Future<void> _abort(String message) async {
++    final session = _session;
++    await _release();
++    _error = message;
++    notifyListeners();
++    try {
++      await session?.disconnect();
++    } catch (_) {}
++  }
++
++  Future<void> _release() async {
++    for (final sub in _sessionSubs) {
++      unawaited(sub.cancel());
++    }
++    _sessionSubs.clear();
++    _session = null;
++    _device = null;
++    _sessionState = SessionState.disconnected;
++    _status = CastStatus.idle;
++    unawaited(WakelockPlus.disable());
++    notifyListeners();
++  }
++}
+diff --git a/lib/modules/anime/cast/cast_discovery.dart b/lib/modules/anime/cast/cast_discovery.dart
+new file mode 100644
+index 0000000..c189556
+--- /dev/null
++++ b/lib/modules/anime/cast/cast_discovery.dart
+@@ -0,0 +1,85 @@
++import 'dart:async';
++import 'dart:io';
++
++import 'package:bonsoir/bonsoir.dart';
++import 'package:dart_cast/dart_cast.dart';
++
++/// Whether device discovery should go through the operating system's own
++/// Bonjour / NSD support instead of dart_cast's pure-Dart mDNS.
++///
++/// iOS (and sandboxed macOS) block raw multicast sockets unless the app holds
++/// an Apple-granted entitlement, which a sideloaded build can't have. Android
++/// is also more reliable through NSD, since the OS manages the multicast lock.
++bool get useNativeDiscovery =>
++    Platform.isIOS || Platform.isMacOS || Platform.isAndroid;
++
++/// An [MdnsLookup] for dart_cast backed by Bonsoir.
++///
++/// dart_cast asks for `_googlecast._tcp.local`; Bonsoir wants the type
++/// without the `.local` suffix.
++Stream<MdnsServiceInfo> bonsoirLookup(String serviceType) {
++  final type = serviceType.replaceFirst(RegExp(r'\.local\.?$'), '');
++
++  BonsoirDiscovery? discovery;
++  StreamSubscription<BonsoirDiscoveryEvent>? subscription;
++  late final StreamController<MdnsServiceInfo> controller;
++
++  Future<void> shutdown() async {
++    final sub = subscription;
++    final disc = discovery;
++    subscription = null;
++    discovery = null;
++    await sub?.cancel();
++    try {
++      await disc?.stop();
++    } catch (_) {}
++  }
++
++  controller = StreamController<MdnsServiceInfo>(
++    onListen: () async {
++      try {
++        final disc = BonsoirDiscovery(type: type);
++        discovery = disc;
++        await disc.initialize();
++        subscription = disc.eventStream!.listen((event) {
++          switch (event) {
++            case BonsoirDiscoveryServiceFoundEvent():
++              // Resolving is what fills in the address and the TXT records.
++              event.service!.resolve(disc.serviceResolver);
++            case BonsoirDiscoveryServiceResolvedEvent():
++              final BonsoirService? service = event.service;
++              if (service == null || controller.isClosed) return;
++              final host = _preferIpv4(service.hostAddresses);
++              if (host == null) return;
++              controller.add(
++                MdnsServiceInfo(
++                  name: service.name,
++                  host: host,
++                  port: service.port,
++                  txtRecords: Map<String, String>.from(service.attributes),
++                ),
++              );
++            default:
++              break;
++          }
++        });
++        await disc.start();
++      } catch (error, stack) {
++        if (!controller.isClosed) controller.addError(error, stack);
++      }
++    },
++    onCancel: shutdown,
++  );
++  return controller.stream;
++}
++
++/// A Chromecast is reached over a plain TLS socket, which can't take an IPv6
++/// link-local address without a scope id, so prefer IPv4.
++String? _preferIpv4(List<String> addresses) {
++  for (final address in addresses) {
++    if (InternetAddress.tryParse(address)?.type == InternetAddressType.IPv4) {
++      return address;
++    }
++  }
++  return null;
++}
+diff --git a/lib/modules/anime/cast/cast_media_builder.dart b/lib/modules/anime/cast/cast_media_builder.dart
+new file mode 100644
+index 0000000..3c80067
+--- /dev/null
++++ b/lib/modules/anime/cast/cast_media_builder.dart
+@@ -0,0 +1,114 @@
++import 'dart:async';
++import 'dart:convert';
++
++import 'package:dart_cast/dart_cast.dart';
++import 'package:http/http.dart' as http;
++import 'package:mangayomi/models/video.dart' as vid;
++
++/// Builds the [CastMedia] for what the player is currently showing.
++///
++/// Remote streams keep the headers (Referer, cookies, ...) the source needs;
++/// dart_cast's proxy adds them when the TV fetches the stream, since a
++/// Chromecast can't send custom headers itself.
++Future<CastMedia> buildCastMedia({
++  required String url,
++  required bool isLocal,
++  Map<String, String>? headers,
++  String? title,
++  Duration? start,
++  List<vid.Track>? subtitles,
++}) async {
++  final startPosition = (start != null && start > Duration.zero) ? start : null;
++
++  if (isLocal) {
++    return CastMedia.file(
++      filePath: url,
++      type: _typeFromExtension(url) ?? CastMediaType.mp4,
++      title: title,
++      startPosition: startPosition,
++    );
++  }
++
++  final type = await detectCastType(url, headers: headers);
++  final castSubtitles = _castSubtitles(subtitles);
++  return CastMedia(
++    url: url,
++    type: type,
++    httpHeaders: headers ?? const {},
++    title: title,
++    startPosition: startPosition,
++    subtitles: castSubtitles,
++    defaultSubtitle: _defaultSubtitle(castSubtitles),
++  );
++}
++
++/// Works out whether [url] is an HLS playlist or a plain file.
++///
++/// The extension decides when it is conclusive. Some sources serve HLS from
++/// URLs with no extension, so those get a tiny ranged request to look for the
++/// `#EXTM3U` header; anything that can't be read is treated as an MP4.
++Future<CastMediaType> detectCastType(
++  String url, {
++  Map<String, String>? headers,
++}) async {
++  final byExtension = _typeFromExtension(url);
++  if (byExtension != null) return byExtension;
++
++  try {
++    final response = await http
++        .get(Uri.parse(url), headers: {...?headers, 'Range': 'bytes=0-63'})
++        .timeout(const Duration(seconds: 6));
++    final head = utf8.decode(
++      response.bodyBytes.take(64).toList(),
++      allowMalformed: true,
++    );
++    if (head.trimLeft().startsWith('#EXTM3U')) return CastMediaType.hls;
++  } catch (_) {}
++  return CastMediaType.mp4;
++}
++
++CastMediaType? _typeFromExtension(String url) {
++  final path = (Uri.tryParse(url)?.path ?? url).toLowerCase();
++  if (path.endsWith('.m3u8') || path.contains('.m3u8/')) {
++    return CastMediaType.hls;
++  }
++  if (path.endsWith('.mp4') || path.endsWith('.m4v')) return CastMediaType.mp4;
++  if (path.endsWith('.mkv')) return CastMediaType.mkv;
++  if (path.endsWith('.ts')) return CastMediaType.mpegTs;
++  // A playlist hidden in the query string, e.g. `/proxy?url=...index.m3u8`.
++  if (url.toLowerCase().contains('.m3u8')) return CastMediaType.hls;
++  return null;
++}
++
++/// The Default Media Receiver shows WebVTT only, so SRT is converted by
++/// dart_cast and styled formats like ASS can't be sent.
++List<CastSubtitle> _castSubtitles(List<vid.Track>? tracks) {
++  final result = <CastSubtitle>[];
++  for (final track in tracks ?? const <vid.Track>[]) {
++    final file = track.file;
++    if (file == null || file.isEmpty) continue;
++    final path = (Uri.tryParse(file)?.path ?? file).toLowerCase();
++    final String format;
++    if (path.endsWith('.vtt')) {
++      format = 'vtt';
++    } else if (path.endsWith('.srt')) {
++      format = 'srt';
++    } else {
++      continue;
++    }
++    final label = (track.label == null || track.label!.isEmpty)
++        ? 'Subtitles ${result.length + 1}'
++        : track.label!;
++    result.add(
++      CastSubtitle(url: file, label: label, language: 'und', format: format),
++    );
++  }
++  return result;
++}
++
++CastSubtitle? _defaultSubtitle(List<CastSubtitle> subtitles) {
++  for (final subtitle in subtitles) {
++    if (subtitle.label.toLowerCase().contains('english')) return subtitle;
++  }
++  return null;
++}
+diff --git a/lib/modules/anime/cast/cast_sheet.dart b/lib/modules/anime/cast/cast_sheet.dart
+new file mode 100644
+index 0000000..d027942
+--- /dev/null
++++ b/lib/modules/anime/cast/cast_sheet.dart
+@@ -0,0 +1,347 @@
++import 'package:dart_cast/dart_cast.dart' show CastDevice;
++import 'package:material_ui/material_ui.dart';
++
++import 'cast_controller.dart';
++
++/// The cast icon for the player's top bar. It fills in while casting.
++class CastButton extends StatelessWidget {
++  const CastButton({
++    super.key,
++    required this.controller,
++    required this.onPressed,
++  });
++
++  final CastController controller;
++  final VoidCallback onPressed;
++
++  @override
++  Widget build(BuildContext context) {
++    return ListenableBuilder(
++      listenable: controller,
++      builder: (context, _) {
++        final casting = controller.isCasting;
++        return IconButton(
++          tooltip: casting
++              ? 'Casting to ${controller.device?.name ?? 'TV'}'
++              : 'Cast to TV',
++          icon: Icon(
++            casting ? Icons.cast_connected : Icons.cast,
++            color: Colors.white,
++          ),
++          onPressed: onPressed,
++        );
++      },
++    );
++  }
++}
++
++/// Opens the device picker, which turns into the remote while casting.
++Future<void> showCastSheet(
++  BuildContext context, {
++  required CastController controller,
++  required void Function(CastDevice device) onDeviceSelected,
++  required VoidCallback onStopCasting,
++}) {
++  return showModalBottomSheet<void>(
++    context: context,
++    isScrollControlled: true,
++    showDragHandle: true,
++    constraints: const BoxConstraints(maxWidth: 520),
++    builder: (_) => CastSheet(
++      controller: controller,
++      onDeviceSelected: onDeviceSelected,
++      onStopCasting: onStopCasting,
++    ),
++  );
++}
++
++class CastSheet extends StatefulWidget {
++  const CastSheet({
++    super.key,
++    required this.controller,
++    required this.onDeviceSelected,
++    required this.onStopCasting,
++  });
++
++  final CastController controller;
++  final void Function(CastDevice device) onDeviceSelected;
++  final VoidCallback onStopCasting;
++
++  @override
++  State<CastSheet> createState() => _CastSheetState();
++}
++
++class _CastSheetState extends State<CastSheet> {
++  CastController get _cast => widget.controller;
++
++  @override
++  void initState() {
++    super.initState();
++    if (!_cast.isBusy) _cast.discover();
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    return SafeArea(
++      child: ListenableBuilder(
++        listenable: _cast,
++        builder: (context, _) {
++          final theme = Theme.of(context);
++          final casting = _cast.isCasting;
++          return Padding(
++            padding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
++            child: SingleChildScrollView(
++              child: Column(
++                mainAxisSize: MainAxisSize.min,
++                crossAxisAlignment: CrossAxisAlignment.start,
++                children: [
++                  Row(
++                    children: [
++                      Icon(casting ? Icons.cast_connected : Icons.cast),
++                      const SizedBox(width: 12),
++                      Expanded(
++                        child: Text(
++                          casting
++                              ? 'Casting to ${_cast.device?.name ?? 'TV'}'
++                              : 'Cast to a TV',
++                          style: theme.textTheme.titleMedium,
++                          overflow: TextOverflow.ellipsis,
++                        ),
++                      ),
++                      if (!_cast.isBusy)
++                        IconButton(
++                          tooltip: 'Search again',
++                          icon: const Icon(Icons.refresh),
++                          onPressed: _cast.status == CastStatus.searching
++                              ? null
++                              : _cast.discover,
++                        ),
++                    ],
++                  ),
++                  if (_cast.error != null)
++                    Padding(
++                      padding: const EdgeInsets.only(top: 8),
++                      child: Text(
++                        _cast.error!,
++                        style: TextStyle(color: theme.colorScheme.error),
++                      ),
++                    ),
++                  const SizedBox(height: 8),
++                  if (casting)
++                    _RemotePanel(
++                      controller: _cast,
++                      onStopCasting: widget.onStopCasting,
++                    )
++                  else if (_cast.status == CastStatus.connecting)
++                    Padding(
++                      padding: const EdgeInsets.symmetric(vertical: 24),
++                      child: Row(
++                        children: [
++                          const SizedBox.square(
++                            dimension: 20,
++                            child: CircularProgressIndicator(strokeWidth: 2),
++                          ),
++                          const SizedBox(width: 16),
++                          Expanded(
++                            child: Text(
++                              'Connecting to ${_cast.device?.name ?? 'TV'}…',
++                            ),
++                          ),
++                        ],
++                      ),
++                    )
++                  else
++                    _DeviceList(
++                      controller: _cast,
++                      onDeviceSelected: widget.onDeviceSelected,
++                    ),
++                ],
++              ),
++            ),
++          );
++        },
++      ),
++    );
++  }
++}
++
++class _DeviceList extends StatelessWidget {
++  const _DeviceList({required this.controller, required this.onDeviceSelected});
++
++  final CastController controller;
++  final void Function(CastDevice device) onDeviceSelected;
++
++  @override
++  Widget build(BuildContext context) {
++    final searching = controller.status == CastStatus.searching;
++    final devices = controller.devices;
++
++    if (devices.isEmpty) {
++      return Padding(
++        padding: const EdgeInsets.symmetric(vertical: 24),
++        child: searching
++            ? const Row(
++                children: [
++                  SizedBox.square(
++                    dimension: 20,
++                    child: CircularProgressIndicator(strokeWidth: 2),
++                  ),
++                  SizedBox(width: 16),
++                  Expanded(child: Text('Looking for TVs on your Wi-Fi…')),
++                ],
++              )
++            : const Text(
++                'No Chromecast found. Check that this device and the TV are on '
++                'the same Wi-Fi network, then search again.',
++              ),
++      );
++    }
++
++    return Column(
++      mainAxisSize: MainAxisSize.min,
++      children: [
++        if (searching) const LinearProgressIndicator(),
++        for (final device in devices)
++          ListTile(
++            contentPadding: EdgeInsets.zero,
++            leading: const Icon(Icons.tv),
++            title: Text(device.name),
++            subtitle: (device.metadata['md'] ?? '').isEmpty
++                ? null
++                : Text(device.metadata['md']!),
++            onTap: () => onDeviceSelected(device),
++          ),
++      ],
++    );
++  }
++}
++
++class _RemotePanel extends StatefulWidget {
++  const _RemotePanel({required this.controller, required this.onStopCasting});
++
++  final CastController controller;
++  final VoidCallback onStopCasting;
++
++  @override
++  State<_RemotePanel> createState() => _RemotePanelState();
++}
++
++class _RemotePanelState extends State<_RemotePanel> {
++  double? _seekDrag;
++  double? _volumeDrag;
++
++  CastController get _cast => widget.controller;
++
++  @override
++  Widget build(BuildContext context) {
++    return Column(
++      mainAxisSize: MainAxisSize.min,
++      children: [
++        ValueListenableBuilder<Duration>(
++          valueListenable: _cast.duration,
++          builder: (context, total, _) => ValueListenableBuilder<Duration>(
++            valueListenable: _cast.position,
++            builder: (context, position, _) => _seekBar(position, total),
++          ),
++        ),
++        Row(
++          mainAxisAlignment: MainAxisAlignment.center,
++          children: [
++            IconButton(
++              iconSize: 32,
++              tooltip: 'Back 10 seconds',
++              icon: const Icon(Icons.replay_10),
++              onPressed: () => _cast.seekBy(const Duration(seconds: -10)),
++            ),
++            IconButton(
++              iconSize: 56,
++              tooltip: _cast.isPlaying ? 'Pause' : 'Play',
++              icon: Icon(
++                _cast.isPlaying
++                    ? Icons.pause_circle_filled
++                    : Icons.play_circle_filled,
++              ),
++              onPressed: _cast.togglePlayPause,
++            ),
++            IconButton(
++              iconSize: 32,
++              tooltip: 'Forward 10 seconds',
++              icon: const Icon(Icons.forward_10),
++              onPressed: () => _cast.seekBy(const Duration(seconds: 10)),
++            ),
++          ],
++        ),
++        Row(
++          children: [
++            const Icon(Icons.volume_down),
++            Expanded(
++              child: Slider(
++                value: _volumeDrag ?? _cast.volume ?? 1.0,
++                onChanged: (value) => setState(() => _volumeDrag = value),
++                onChangeEnd: (value) {
++                  setState(() => _volumeDrag = null);
++                  _cast.setVolume(value);
++                },
++              ),
++            ),
++            const Icon(Icons.volume_up),
++          ],
++        ),
++        const SizedBox(height: 8),
++        SizedBox(
++          width: double.infinity,
++          child: FilledButton.tonalIcon(
++            onPressed: widget.onStopCasting,
++            icon: const Icon(Icons.cast_connected),
++            label: const Text('Stop casting'),
++          ),
++        ),
++      ],
++    );
++  }
++
++  Widget _seekBar(Duration position, Duration total) {
++    final enabled = total > Duration.zero;
++    final max = enabled ? total.inMilliseconds.toDouble() : 1.0;
++    final current = (_seekDrag ?? position.inMilliseconds.toDouble())
++        .clamp(0.0, max)
++        .toDouble();
++    return Column(
++      children: [
++        Slider(
++          value: enabled ? current : 0.0,
++          max: max,
++          onChanged: enabled
++              ? (value) => setState(() => _seekDrag = value)
++              : null,
++          onChangeEnd: enabled
++              ? (value) {
++                  setState(() => _seekDrag = null);
++                  _cast.seek(Duration(milliseconds: value.round()));
++                }
++              : null,
++        ),
++        Padding(
++          padding: const EdgeInsets.symmetric(horizontal: 16),
++          child: Row(
++            mainAxisAlignment: MainAxisAlignment.spaceBetween,
++            children: [
++              Text(_format(Duration(milliseconds: current.round()))),
++              Text(enabled ? _format(total) : '--:--'),
++            ],
++          ),
++        ),
++      ],
++    );
++  }
++
++  static String _format(Duration value) {
++    String two(int n) => n.toString().padLeft(2, '0');
++    final hours = value.inHours;
++    final minutes = value.inMinutes.remainder(60);
++    final seconds = value.inSeconds.remainder(60);
++    return hours > 0
++        ? '$hours:${two(minutes)}:${two(seconds)}'
++        : '${two(minutes)}:${two(seconds)}';
++  }
++}
+diff --git a/lib/modules/anime/mixins/anime_player_controls_mixin.dart b/lib/modules/anime/mixins/anime_player_controls_mixin.dart
+index 7ce338e..d4de57f 100644
+--- a/lib/modules/anime/mixins/anime_player_controls_mixin.dart
++++ b/lib/modules/anime/mixins/anime_player_controls_mixin.dart
+@@ -8,6 +8,8 @@ import 'package:mangayomi/models/chapter.dart';
+ import 'package:mangayomi/modules/anime/mixins/anime_mpv_bridge_mixin.dart';
+ import 'package:mangayomi/modules/anime/mixins/anime_player_settings_mixin.dart';
+ import 'package:mangayomi/modules/anime/mixins/anime_track_selection_mixin.dart';
++import 'package:mangayomi/modules/anime/cast/cast_controller.dart';
++import 'package:mangayomi/modules/anime/cast/cast_sheet.dart';
+ import 'package:mangayomi/modules/anime/utils/always_on_top.dart';
+ import 'package:mangayomi/modules/anime/utils/player_shortcuts.dart';
+ import 'package:mangayomi/modules/anime/widgets/desktop.dart';
+@@ -46,6 +48,8 @@ mixin AnimePlayerControlsMixin<T extends riv.ConsumerStatefulWidget>
+   VoidCallback get controlsChangeFitLabel;
+   Future<void> Function(bool isFullscreen) get controlsToggleFullscreen;
+   VoidCallback get controlsOpenTvSettingsPanel;
++  CastController get controlsCast;
++  VoidCallback get controlsOpenCastSheet;
+ 
+   bool _playAfterOverlay = false;
+ 
+@@ -416,6 +420,11 @@ mixin AnimePlayerControlsMixin<T extends riv.ConsumerStatefulWidget>
+       );
+     }
+ 
++    Widget castButton() => CastButton(
++      controller: controlsCast,
++      onPressed: controlsOpenCastSheet,
++    );
++
+     // The series and the episode, as the readers' bars and the loading
+     // state name them.
+     final title = Padding(
+@@ -453,6 +462,7 @@ mixin AnimePlayerControlsMixin<T extends riv.ConsumerStatefulWidget>
+                 ),
+                 onPressed: toggleAlwaysOnTop,
+               ),
++            castButton(),
+             episodesButton(),
+             // A phone shares from the settings. The settings themselves are
+             // in the panel at the foot, on every platform, not here too.
+@@ -467,6 +477,10 @@ mixin AnimePlayerControlsMixin<T extends riv.ConsumerStatefulWidget>
+           child: Row(
+             mainAxisSize: MainAxisSize.min,
+             children: [
++              KeyedSubtree(
++                key: const ValueKey('mobile-player-portrait-cast'),
++                child: castButton(),
++              ),
+               KeyedSubtree(
+                 key: const ValueKey('mobile-player-portrait-episodes'),
+                 child: episodesButton(),
+diff --git a/pubspec.yaml b/pubspec.yaml
+index ad38ed8..86eebd1 100644
+--- a/pubspec.yaml
++++ b/pubspec.yaml
+@@ -97,6 +97,10 @@ dependencies:
+   win32_registry: ^3.0.3
+   protobuf: ^5.0.0
+   fixnum: ^1.1.1
++  # Chromecast: dart_cast speaks the cast protocol and proxies streams that
++  # need custom headers; bonsoir finds TVs through the OS's own Bonjour/NSD.
++  dart_cast: ^0.7.4
++  bonsoir: ^7.1.6
+   device_info_plus: ^13.2.0
+   marquee: ^2.2.3
+   d4rt: ^0.2.6

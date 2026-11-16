@@ -8,6 +8,8 @@ import 'package:mangayomi/models/chapter.dart';
 import 'package:mangayomi/modules/anime/mixins/anime_mpv_bridge_mixin.dart';
 import 'package:mangayomi/modules/anime/mixins/anime_player_settings_mixin.dart';
 import 'package:mangayomi/modules/anime/mixins/anime_track_selection_mixin.dart';
+import 'package:mangayomi/modules/anime/cast/cast_controller.dart';
+import 'package:mangayomi/modules/anime/cast/cast_sheet.dart';
 import 'package:mangayomi/modules/anime/utils/always_on_top.dart';
 import 'package:mangayomi/modules/anime/utils/player_shortcuts.dart';
 import 'package:mangayomi/modules/anime/widgets/desktop.dart';
@@ -46,6 +48,8 @@ mixin AnimePlayerControlsMixin<T extends riv.ConsumerStatefulWidget>
   VoidCallback get controlsChangeFitLabel;
   Future<void> Function(bool isFullscreen) get controlsToggleFullscreen;
   VoidCallback get controlsOpenTvSettingsPanel;
+  CastController get controlsCast;
+  VoidCallback get controlsOpenCastSheet;
 
   bool _playAfterOverlay = false;
 
@@ -416,6 +420,11 @@ mixin AnimePlayerControlsMixin<T extends riv.ConsumerStatefulWidget>
       );
     }
 
+    Widget castButton() => CastButton(
+      controller: controlsCast,
+      onPressed: controlsOpenCastSheet,
+    );
+
     // The series and the episode, as the readers' bars and the loading
     // state name them.
     final title = Padding(
@@ -453,6 +462,7 @@ mixin AnimePlayerControlsMixin<T extends riv.ConsumerStatefulWidget>
                 ),
                 onPressed: toggleAlwaysOnTop,
               ),
+            castButton(),
             episodesButton(),
             // A phone shares from the settings. The settings themselves are
             // in the panel at the foot, on every platform, not here too.
@@ -467,6 +477,10 @@ mixin AnimePlayerControlsMixin<T extends riv.ConsumerStatefulWidget>
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
+              KeyedSubtree(
+                key: const ValueKey('mobile-player-portrait-cast'),
+                child: castButton(),
+              ),
               KeyedSubtree(
                 key: const ValueKey('mobile-player-portrait-episodes'),
                 child: episodesButton(),
