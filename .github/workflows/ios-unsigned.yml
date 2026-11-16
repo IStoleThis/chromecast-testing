@@ -4,16 +4,27 @@ name: Build unsigned iOS IPA
 # AltStore or Sideloadly, which sign it with your own Apple ID on install.
 # (The official release workflow signs with the maintainer's certificate, which
 # a fork doesn't have.) Run it from the repository's Actions tab, then download
-# the "Mangayomi-ios-unsigned" artifact from the finished run.
+# the "Mangayomi-ios-unsigned-..." artifact from whichever build succeeded.
+#
+# Two builds run side by side with different Xcode versions, since Xcode's
+# linker has crashed on this project's release build with some versions.
 
 on:
   workflow_dispatch:
 
 jobs:
   build-ios-ipa:
-    # Xcode 26's linker crashes (Segmentation fault: 11) on the release build,
-    # so this builds with Xcode 16.4 on macOS 15, as the project's CI does.
-    runs-on: macos-15-intel
+    name: build (${{ matrix.runner }}, Xcode ${{ matrix.xcode }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            xcode: "16.4"
+          # The official release pairs Xcode 26.6 with Rust 1.99.1.
+          - runner: macos-26-intel
+            xcode: "26.6"
+    runs-on: ${{ matrix.runner }}
     env:
       CARGOKIT_TOOLCHAIN: "1.99.1"
     steps:
@@ -37,27 +48,60 @@ jobs:
         uses: Swatinem/rust-cache@v2.9.3
         with:
           workspaces: rust
+          key: ${{ matrix.runner }}
           cache-on-failure: true
 
-      - name: Select Xcode 16.4
+      - name: Select Xcode ${{ matrix.xcode }}
         run: |
+          echo "Installed Xcode versions:"
           ls -d /Applications/Xcode*.app
-          sudo xcode-select --switch /Applications/Xcode_16.4.app
+          if [ -d "/Applications/Xcode_${{ matrix.xcode }}.app" ]; then
+            sudo xcode-select --switch "/Applications/Xcode_${{ matrix.xcode }}.app"
+          else
+            echo "::warning::Xcode ${{ matrix.xcode }} is not installed here; using the default Xcode."
+          fi
           xcodebuild -version
 
       - name: Flutter pub get
         run: flutter pub get
 
+      # The full (verbose) output goes to build.log. On failure, the next step
+      # prints the errors from it, because Flutter's normal output can hide them.
       - name: Build iOS (no code signing)
         run: |
-          flutter build ios --release --no-codesign
+          set -o pipefail
+          flutter build ios --release --no-codesign -v > build.log 2>&1
+          tail -n 15 build.log
           mkdir -p build/ios/iphoneos/Payload
           mv build/ios/iphoneos/Runner.app build/ios/iphoneos/Payload/
           cd build/ios/iphoneos
-          zip -r Mangayomi-ios-unsigned.ipa Payload
+          zip -qr Mangayomi-ios-unsigned.ipa Payload
+
+      - name: Show build errors
+        if: failure()
+        run: |
+          [ -f build.log ] || { echo "No build log (the build step did not start)."; exit 0; }
+          # Drop Flutter's "[ +12 ms] " timing prefix from each line.
+          sed -E 's/^\[[^]]*\] //' build.log > build-clean.log
+          echo "===== Failed build commands ====="
+          grep -A 12 "The following build commands failed" build-clean.log || echo "(none listed)"
+          echo
+          echo "===== Error lines ====="
+          grep -E "(error|Error): |^ld: |Undefined symbols|BUILD FAILED|nonzero exit code|Segmentation fault|XCResult" build-clean.log \
+            | grep -v "warning:" | awk '!seen[$0]++' | head -n 80 || true
+          echo
+          echo "===== Last 30 lines ====="
+          tail -n 30 build-clean.log
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: build-log-${{ matrix.runner }}
+          path: build.log
 
       - name: Upload artifact iOS IPA
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: Mangayomi-ios-unsigned
+          name: Mangayomi-ios-unsigned-${{ matrix.runner }}
           path: "build/ios/iphoneos/Mangayomi-ios-unsigned.ipa"
