@@ -13,7 +13,7 @@ jobs:
   build-ios-ipa:
     # Xcode 26's linker crashes (Segmentation fault: 11) on the release build,
     # so this builds with Xcode 16.4 on macOS 15, as the project's CI does.
-    runs-on: macos-15
+    runs-on: macos-15-intel
     env:
       CARGOKIT_TOOLCHAIN: "1.99.1"
     steps:
