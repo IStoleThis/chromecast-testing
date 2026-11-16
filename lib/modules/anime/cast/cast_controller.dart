@@ -258,7 +258,8 @@ class CastController extends ChangeNotifier {
   void _bind(CastSession session) {
     _session = session;
     _sessionState = session.state;
-    _volume = session.volume;
+    // Filled in by volumeStream once the TV reports its volume.
+    _volume = null;
     _sessionSubs
       ..add(session.stateStream.listen(_onSessionState))
       ..add(

@@ -1,349 +1,107 @@
-import 'dart:async';
+name: Build unsigned iOS IPA
 
-import 'package:dart_cast/dart_cast.dart';
-import 'package:flutter/foundation.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
+# Builds an iOS app without code signing, for sideloading with a tool such as
+# AltStore or Sideloadly, which sign it with your own Apple ID on install.
+# (The official release workflow signs with the maintainer's certificate, which
+# a fork doesn't have.) Run it from the repository's Actions tab, then download
+# the "Mangayomi-ios-unsigned-..." artifact from whichever build succeeded.
+#
+# Two builds run side by side with different Xcode versions, since Xcode's
+# linker has crashed on this project's release build with some versions.
 
-import 'cast_discovery.dart';
+on:
+  workflow_dispatch:
 
-enum CastStatus { idle, searching, connecting, casting }
+jobs:
+  build-ios-ipa:
+    name: build (${{ matrix.runner }}, Xcode ${{ matrix.xcode }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            xcode: "16.4"
+          # The official release pairs Xcode 26.6 with Rust 1.99.1.
+          - runner: macos-26-intel
+            xcode: "26.6"
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGOKIT_TOOLCHAIN: "1.99.1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
 
-/// App-wide Chromecast state.
-///
-/// It is a singleton so a cast session outlives a single player screen: when
-/// "play next episode" replaces the player, the new screen finds the session
-/// still open and loads the next episode onto the same TV.
-///
-/// Playback position and duration are separate [ValueNotifier]s because they
-/// tick every second, and most listeners only care about the structural state
-/// (device list, connecting, casting, errors) that [notifyListeners] reports.
-class CastController extends ChangeNotifier {
-  CastController._();
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2.23.0
+        with:
+          channel: "stable"
 
-  static final CastController instance = CastController._();
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.CARGOKIT_TOOLCHAIN }}
+          targets: aarch64-apple-ios,x86_64-apple-ios
 
-  late final CastService _service = CastService(
-    discoveryProviders: [
-      ChromecastDiscoveryProvider(
-        mdnsLookup: useNativeDiscovery ? bonsoirLookup : null,
-      ),
-    ],
-    sessionFactory: (device) => ChromecastSession(device: device),
-  );
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: rust
+          key: ${{ matrix.runner }}
+          cache-on-failure: true
 
-  /// Where the TV is in the media, while casting.
-  final ValueNotifier<Duration> position = ValueNotifier(Duration.zero);
+      - name: Select Xcode ${{ matrix.xcode }}
+        run: |
+          echo "Installed Xcode versions:"
+          ls -d /Applications/Xcode*.app
+          if [ -d "/Applications/Xcode_${{ matrix.xcode }}.app" ]; then
+            sudo xcode-select --switch "/Applications/Xcode_${{ matrix.xcode }}.app"
+          else
+            echo "::warning::Xcode ${{ matrix.xcode }} is not installed here; using the default Xcode."
+          fi
+          xcodebuild -version
 
-  /// How long the media on the TV is, once the receiver has reported it.
-  final ValueNotifier<Duration> duration = ValueNotifier(Duration.zero);
+      - name: Flutter pub get
+        run: flutter pub get
 
-  final StreamController<void> _finished = StreamController<void>.broadcast();
+      # The full (verbose) output goes to build.log. On failure, the next step
+      # prints the errors from it, because Flutter's normal output can hide them.
+      - name: Build iOS (no code signing)
+        run: |
+          set -o pipefail
+          flutter build ios --release --no-codesign -v > build.log 2>&1
+          tail -n 15 build.log
+          mkdir -p build/ios/iphoneos/Payload
+          mv build/ios/iphoneos/Runner.app build/ios/iphoneos/Payload/
+          cd build/ios/iphoneos
+          zip -qr Mangayomi-ios-unsigned.ipa Payload
 
-  /// Fires when the media on the TV plays through to its end.
-  Stream<void> get onFinished => _finished.stream;
+      - name: Show build errors
+        if: failure()
+        run: |
+          [ -f build.log ] || { echo "No build log (the build step did not start)."; exit 0; }
+          # Drop Flutter's "[ +12 ms] " timing prefix from each line.
+          sed -E 's/^\[[^]]*\] //' build.log > build-clean.log
+          echo "===== Failed build commands ====="
+          grep -A 12 "The following build commands failed" build-clean.log || echo "(none listed)"
+          echo
+          echo "===== Error lines ====="
+          grep -E "(error|Error): |^ld: |Undefined symbols|BUILD FAILED|nonzero exit code|Segmentation fault|XCResult" build-clean.log \
+            | grep -v "warning:" | awk '!seen[$0]++' | head -n 80 || true
+          echo
+          echo "===== Last 30 lines ====="
+          tail -n 30 build-clean.log
 
-  CastStatus _status = CastStatus.idle;
-  List<CastDevice> _devices = const [];
-  CastDevice? _device;
-  CastSession? _session;
-  SessionState _sessionState = SessionState.disconnected;
-  double? _volume;
-  String? _error;
-  Duration _lastLivePosition = Duration.zero;
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: build-log-${{ matrix.runner }}
+          path: build.log
 
-  StreamSubscription<List<CastDevice>>? _discoverySub;
-  Timer? _searchTimer;
-  final List<StreamSubscription<dynamic>> _sessionSubs = [];
-
-  int _attachedViews = 0;
-  Timer? _orphanTimer;
-
-  CastStatus get status => _status;
-  bool get isCasting => _status == CastStatus.casting;
-  bool get isBusy =>
-      _status == CastStatus.connecting || _status == CastStatus.casting;
-  List<CastDevice> get devices => _devices;
-  CastDevice? get device => _device;
-  double? get volume => _volume;
-  String? get error => _error;
-  bool get isPlaying =>
-      _sessionState == SessionState.playing ||
-      _sessionState == SessionState.buffering ||
-      _sessionState == SessionState.loading;
-
-  // ---------------------------------------------------------------------------
-  // Player screens come and go; the session is dropped once none is left.
-  // ---------------------------------------------------------------------------
-
-  /// A player screen started using the controller.
-  void attach() {
-    _attachedViews++;
-    _orphanTimer?.cancel();
-    _orphanTimer = null;
-  }
-
-  /// A player screen is done. If it was the last one and a session is open,
-  /// the session ends after a short grace period, which lets the next
-  /// episode's screen take it over instead.
-  void detach() {
-    if (_attachedViews > 0) _attachedViews--;
-    if (_attachedViews > 0) return;
-    if (_session == null) {
-      _stopSearching();
-      return;
-    }
-    _orphanTimer?.cancel();
-    _orphanTimer = Timer(const Duration(seconds: 6), () {
-      if (_attachedViews == 0) unawaited(end());
-    });
-  }
-
-  // ---------------------------------------------------------------------------
-  // Discovery
-  // ---------------------------------------------------------------------------
-
-  /// Looks for Chromecasts on the local network for a few seconds.
-  Future<void> discover() async {
-    if (isBusy) return;
-    await _discoverySub?.cancel();
-    _discoverySub = null;
-    _searchTimer?.cancel();
-
-    _devices = const [];
-    _error = null;
-    _status = CastStatus.searching;
-    notifyListeners();
-
-    const timeout = Duration(seconds: 8);
-    try {
-      _discoverySub = _service
-          .startDiscovery(
-            protocols: {CastProtocol.chromecast},
-            timeout: timeout,
-          )
-          .listen(
-            (found) {
-              _devices = [...found]
-                ..sort(
-                  (a, b) =>
-                      a.name.toLowerCase().compareTo(b.name.toLowerCase()),
-                );
-              notifyListeners();
-            },
-            onError: (Object error) {
-              _error = 'Could not search for devices: $error';
-              _endSearch();
-            },
-            onDone: _endSearch,
-          );
-      // Discovery should close itself at the timeout; this is the backstop.
-      _searchTimer = Timer(timeout + const Duration(seconds: 2), _endSearch);
-    } catch (error) {
-      _error = 'Could not search for devices: $error';
-      _endSearch();
-    }
-  }
-
-  void _endSearch() {
-    _searchTimer?.cancel();
-    _searchTimer = null;
-    if (_status == CastStatus.searching) {
-      _status = CastStatus.idle;
-      notifyListeners();
-    }
-  }
-
-  void _stopSearching() {
-    unawaited(_discoverySub?.cancel());
-    _discoverySub = null;
-    _service.stopDiscovery();
-    _endSearch();
-  }
-
-  // ---------------------------------------------------------------------------
-  // Session
-  // ---------------------------------------------------------------------------
-
-  /// Connects to [device] and starts the media [buildMedia] returns on it.
-  /// Returns whether it worked; on failure [error] says why.
-  ///
-  /// The media is built once connected so the "connecting" state shows while
-  /// the stream is being inspected, which can take a few seconds.
-  Future<bool> start(
-    CastDevice device,
-    Future<CastMedia> Function() buildMedia,
-  ) async {
-    _orphanTimer?.cancel();
-    _stopSearching();
-
-    _error = null;
-    _device = device;
-    _status = CastStatus.connecting;
-    notifyListeners();
-
-    try {
-      final session = await _service.connect(device);
-      _bind(session);
-      final media = await buildMedia();
-      _resetProgress(media);
-      await session.loadMedia(media);
-      _status = CastStatus.casting;
-      unawaited(WakelockPlus.enable());
-      notifyListeners();
-      return true;
-    } catch (error) {
-      await _abort('Could not cast to ${device.name}: $error');
-      return false;
-    }
-  }
-
-  /// Switches the TV to [media] on the open session, e.g. for the next
-  /// episode or another quality.
-  Future<bool> load(CastMedia media) async {
-    final session = _session;
-    if (session == null) return false;
-    try {
-      _resetProgress(media);
-      await session.loadMedia(media);
-      _error = null;
-      notifyListeners();
-      return true;
-    } catch (error) {
-      _error = 'The TV could not play this: $error';
-      notifyListeners();
-      return false;
-    }
-  }
-
-  Future<void> play() => _command((s) => s.play());
-
-  Future<void> pause() => _command((s) => s.pause());
-
-  Future<void> togglePlayPause() => isPlaying ? pause() : play();
-
-  Future<void> seek(Duration to) async {
-    final total = duration.value;
-    var target = to < Duration.zero ? Duration.zero : to;
-    if (total > Duration.zero && target > total) target = total;
-    position.value = target;
-    await _command((s) => s.seek(target));
-  }
-
-  Future<void> seekBy(Duration delta) => seek(position.value + delta);
-
-  Future<void> setVolume(double value) {
-    final volume = value.clamp(0.0, 1.0).toDouble();
-    _volume = volume;
-    notifyListeners();
-    return _command((s) => s.setVolume(volume));
-  }
-
-  /// Stops what is playing on the TV and disconnects from it.
-  Future<void> end() async {
-    final session = _session;
-    await _release();
-    if (session == null) return;
-    try {
-      await session.stop();
-    } catch (_) {}
-    try {
-      await session.disconnect();
-    } catch (_) {}
-  }
-
-  // ---------------------------------------------------------------------------
-  // Internals
-  // ---------------------------------------------------------------------------
-
-  void _bind(CastSession session) {
-    _session = session;
-    _sessionState = session.state;
-    // Filled in by volumeStream once the TV reports its volume.
-    _volume = null;
-    _sessionSubs
-      ..add(session.stateStream.listen(_onSessionState))
-      ..add(
-        session.positionStream.listen((value) {
-          position.value = value;
-          if (_sessionState == SessionState.playing) _lastLivePosition = value;
-        }),
-      )
-      ..add(session.durationStream.listen((value) => duration.value = value))
-      ..add(
-        session.volumeStream.listen((value) {
-          _volume = value;
-          notifyListeners();
-        }),
-      );
-  }
-
-  void _resetProgress(CastMedia media) {
-    position.value = media.startPosition ?? Duration.zero;
-    duration.value = Duration.zero;
-    _lastLivePosition = position.value;
-  }
-
-  void _onSessionState(SessionState next) {
-    final previous = _sessionState;
-    _sessionState = next;
-
-    if (next == SessionState.disconnected) {
-      // The TV (or the network) ended the session.
-      if (_session != null) unawaited(_release());
-      return;
-    }
-
-    final wasPlaying =
-        previous == SessionState.playing ||
-        previous == SessionState.buffering ||
-        previous == SessionState.paused;
-    if (next == SessionState.idle &&
-        wasPlaying &&
-        _status == CastStatus.casting &&
-        _endedNearTheEnd()) {
-      _finished.add(null);
-    }
-    notifyListeners();
-  }
-
-  bool _endedNearTheEnd() {
-    final total = duration.value;
-    return total > Duration.zero &&
-        _lastLivePosition >= total - const Duration(seconds: 15);
-  }
-
-  Future<void> _command(Future<void> Function(CastSession session) run) async {
-    final session = _session;
-    if (session == null) return;
-    try {
-      await run(session);
-    } catch (error) {
-      _error = 'The TV did not respond: $error';
-      notifyListeners();
-    }
-  }
-
-  /// Gives up on a session that failed to start, remembering [message].
-  Future<void> _abort(String message) async {
-    final session = _session;
-    await _release();
-    _error = message;
-    notifyListeners();
-    try {
-      await session?.disconnect();
-    } catch (_) {}
-  }
-
-  Future<void> _release() async {
-    for (final sub in _sessionSubs) {
-      unawaited(sub.cancel());
-    }
-    _sessionSubs.clear();
-    _session = null;
-    _device = null;
-    _sessionState = SessionState.disconnected;
-    _status = CastStatus.idle;
-    unawaited(WakelockPlus.disable());
-    notifyListeners();
-  }
-}
+      - name: Upload artifact iOS IPA
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: Mangayomi-ios-unsigned-${{ matrix.runner }}
+          path: "build/ios/iphoneos/Mangayomi-ios-unsigned.ipa"
