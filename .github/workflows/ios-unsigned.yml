@@ -1,32 +1,36 @@
 name: Build unsigned iOS IPA
 
-# Builds an iOS app without code signing, for sideloading with a tool such as
-# AltStore or Sideloadly, which sign it with your own Apple ID on install.
-# (The official release workflow signs with the maintainer's certificate, which
-# a fork doesn't have.) Run it from the repository's Actions tab, then download
-# the "Mangayomi-ios-unsigned-..." artifact from whichever build succeeded.
+# Builds the iOS app without code signing, for sideloading. AltStore (or
+# Sideloadly) signs it with your own Apple ID when it installs it.
 #
-# Two builds run side by side with different Xcode versions, since Xcode's
-# linker has crashed on this project's release build with some versions.
+# With "Publish to AltStore" ticked, the build is also published as a GitHub
+# Release, together with an AltStore source file. Add this source to AltStore
+# once, and every published build then shows up there as an update:
+#
+#   https://github.com/<owner>/<repo>/releases/latest/download/altstore-source.json
+#
+# The repository must be public, or AltStore can't download from it.
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to AltStore"
+        type: boolean
+        default: true
+
+permissions:
+  # Publishing creates a GitHub Release.
+  contents: write
 
 jobs:
   build-ios-ipa:
-    name: build (${{ matrix.runner }}, Xcode ${{ matrix.xcode }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15-intel
-            xcode: "16.4"
-          # The official release pairs Xcode 26.6 with Rust 1.99.1.
-          - runner: macos-26-intel
-            xcode: "26.6"
-    runs-on: ${{ matrix.runner }}
+    # Xcode 26.6 with Rust 1.99.1 is the pairing the official release uses;
+    # other Xcode versions have crashed while linking this project's release build.
+    runs-on: macos-26-intel
     env:
       CARGOKIT_TOOLCHAIN: "1.99.1"
+      XCODE_VERSION: "26.6"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4.4.0
@@ -48,29 +52,46 @@ jobs:
         uses: Swatinem/rust-cache@v2.9.3
         with:
           workspaces: rust
-          key: ${{ matrix.runner }}
+          key: macos-26-intel
           cache-on-failure: true
 
-      - name: Select Xcode ${{ matrix.xcode }}
+      - name: Select Xcode ${{ env.XCODE_VERSION }}
         run: |
           echo "Installed Xcode versions:"
           ls -d /Applications/Xcode*.app
-          if [ -d "/Applications/Xcode_${{ matrix.xcode }}.app" ]; then
-            sudo xcode-select --switch "/Applications/Xcode_${{ matrix.xcode }}.app"
+          if [ -d "/Applications/Xcode_${XCODE_VERSION}.app" ]; then
+            sudo xcode-select --switch "/Applications/Xcode_${XCODE_VERSION}.app"
           else
-            echo "::warning::Xcode ${{ matrix.xcode }} is not installed here; using the default Xcode."
+            echo "::warning::Xcode ${XCODE_VERSION} is not installed here; using the default Xcode."
           fi
           xcodebuild -version
 
       - name: Flutter pub get
         run: flutter pub get
 
+      # Keeps Mangayomi's version (e.g. 0.9.96) and gives every run its own
+      # build number, so AltStore sees each published build as an update.
+      - name: Work out the version
+        id: version
+        run: |
+          full=$(grep -E '^version:' pubspec.yaml | head -n 1 | awk '{print $2}')
+          name="${full%%+*}"
+          base="${full#*+}"
+          [ "$base" = "$full" ] && base=0
+          number=$(( base * 1000 + GITHUB_RUN_NUMBER ))
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "Building version $name, build $number"
+
       # The full (verbose) output goes to build.log. On failure, the next step
       # prints the errors from it, because Flutter's normal output can hide them.
       - name: Build iOS (no code signing)
         run: |
           set -o pipefail
-          flutter build ios --release --no-codesign -v > build.log 2>&1
+          flutter build ios --release --no-codesign \
+            --build-name="${{ steps.version.outputs.name }}" \
+            --build-number="${{ steps.version.outputs.number }}" \
+            -v > build.log 2>&1
           tail -n 15 build.log
           mkdir -p build/ios/iphoneos/Payload
           mv build/ios/iphoneos/Runner.app build/ios/iphoneos/Payload/
@@ -97,11 +118,127 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: build-log-${{ matrix.runner }}
+          name: build-log
           path: build.log
 
       - name: Upload artifact iOS IPA
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: Mangayomi-ios-unsigned-${{ matrix.runner }}
+          name: Mangayomi-ios-unsigned
           path: "build/ios/iphoneos/Mangayomi-ios-unsigned.ipa"
+
+      # Writes altstore-source.json describing this build. AltStore checks the
+      # version, build number and permissions against the app itself, so they
+      # are all read from the built app rather than typed in here.
+      - name: Make AltStore source
+        if: ${{ inputs.publish }}
+        run: |
+          python3 - <<'PY'
+          import datetime, hashlib, json, os, plistlib, shutil, subprocess
+
+          app_dir = "build/ios/iphoneos/Payload/Runner.app"
+          ipa = "build/ios/iphoneos/Mangayomi-ios-unsigned.ipa"
+          repo = os.environ["GITHUB_REPOSITORY"]
+          owner = repo.split("/")[0]
+          run_number = os.environ["GITHUB_RUN_NUMBER"]
+
+          with open(os.path.join(app_dir, "Info.plist"), "rb") as f:
+              info = plistlib.load(f)
+          version = str(info["CFBundleShortVersionString"])
+          build = str(info["CFBundleVersion"])
+          bundle_id = info["CFBundleIdentifier"]
+          min_os = str(info.get("MinimumOSVersion", "15.0"))
+          privacy = {
+              key: value
+              for key, value in info.items()
+              if key.endswith("UsageDescription") and isinstance(value, str)
+          }
+
+          tag = f"cast-v{version}-{build}"
+          asset = f"Mangayomi-cast-{version}-{build}.ipa"
+          shutil.copyfile(ipa, asset)
+          with open(asset, "rb") as f:
+              data = f.read()
+          size = len(data)
+          sha256 = hashlib.sha256(data).hexdigest()
+          download_url = f"https://github.com/{repo}/releases/download/{tag}/{asset}"
+          now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+          notes = subprocess.run(
+              ["git", "log", "-1", "--pretty=%s"], capture_output=True, text=True
+          ).stdout.strip() or "New build"
+          icon = (
+              f"https://raw.githubusercontent.com/{repo}/{os.environ['GITHUB_SHA']}"
+              "/repo/images/icons/icon_default.webp"
+          )
+          description = (
+              "Mangayomi with Chromecast support: cast anime from the player "
+              "to a TV on the same Wi-Fi."
+          )
+
+          source = {
+              "name": "Mangayomi Cast",
+              "identifier": f"io.github.{owner.lower()}.mangayomi-cast",
+              "subtitle": "Mangayomi with Chromecast support",
+              "description": description + f"\n\nhttps://github.com/{repo}",
+              "iconURL": icon,
+              "website": f"https://github.com/{repo}",
+              "tintColor": "EF4444",
+              "apps": [
+                  {
+                      "name": "Mangayomi",
+                      "bundleIdentifier": bundle_id,
+                      "developerName": "Moustapha Kodjo Amadou (Chromecast fork)",
+                      "subtitle": "Read manga, novels, and watch anime",
+                      "localizedDescription": description,
+                      "iconURL": icon,
+                      "tintColor": "EF4444",
+                      "category": "entertainment",
+                      "versions": [
+                          {
+                              "version": version,
+                              "buildVersion": build,
+                              "marketingVersion": f"{version} (cast build {run_number})",
+                              "date": now,
+                              "localizedDescription": notes,
+                              "downloadURL": download_url,
+                              "size": size,
+                              "sha256": sha256,
+                              "minOSVersion": min_os,
+                          }
+                      ],
+                      # The build is unsigned, so it carries no entitlements;
+                      # AltStore adds its own when it signs the app.
+                      "appPermissions": {"entitlements": [], "privacy": privacy},
+                      # Older AltStore and SideStore versions read these keys.
+                      "version": version,
+                      "versionDate": now,
+                      "versionDescription": notes,
+                      "downloadURL": download_url,
+                      "size": size,
+                  }
+              ],
+              "news": [],
+          }
+          with open("altstore-source.json", "w") as f:
+              json.dump(source, f, indent=2)
+
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"RELEASE_TAG={tag}\nRELEASE_ASSET={asset}\n")
+              f.write(f"RELEASE_TITLE=Mangayomi Cast {version} (cast build {run_number})\n")
+          print(json.dumps(source["apps"][0]["versions"][0], indent=2))
+          PY
+
+      - name: Publish release
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A re-run of the same run reuses its build number, so replace the
+          # release it made the first time.
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$RELEASE_TAG" "$RELEASE_ASSET" altstore-source.json \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TITLE" \
+            --notes "$(git log -1 --pretty=%s)" \
+            --latest
+          echo "AltStore source: https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/altstore-source.json"
