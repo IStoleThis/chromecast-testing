@@ -100,7 +100,7 @@ dependencies:
   # Chromecast: dart_cast speaks the cast protocol and proxies streams that
   # need custom headers; bonsoir finds TVs through the OS's own Bonjour/NSD.
   dart_cast: ^0.7.4
-  bonsoir: ^7.1.6
+  bonsoir: ^7.1.5
   device_info_plus: ^13.2.0
   marquee: ^2.2.3
   d4rt: ^0.2.6
