@@ -12,7 +12,12 @@
 
 
 Mangayomi is an open-source Flutter app for reading manga, novels, and watching animes across multiple platforms.
+
+**This fork adds Chromecast casting to the anime player.**
 </div>
+
+> [!NOTE]
+> This is an unofficial fork of [kodjodevf/mangayomi](https://github.com/kodjodevf/mangayomi). It adds [Chromecast casting](#chromecast-casting); everything else is the official app, made by its developers.
 
 > [!WARNING]
 > **Official Warning**: Mangayomi does not have an official website. This GitHub repository ([kodjodevf/mangayomi](https://github.com/kodjodevf/mangayomi)) and our official [Discord server](https://discord.com/invite/EjfBuYahsP) are the **only official sources** for Mangayomi. Always download official releases from our GitHub repository.
@@ -29,22 +34,37 @@ Features include:
 * Categories to organize your library.
 * Light and dark themes.
 * Create backups locally to read offline or to your desired cloud service.
+* Cast anime to a Chromecast or Google TV (this fork).
 
 </div>
 
+## Chromecast casting
+
+Tap the cast icon at the top of the anime player and pick a Chromecast, Google TV or TV with Chromecast built-in on the same Wi-Fi.
+
+* Works with sources that need extra headers: the app relays the stream to the TV.
+* Starts where you were, saves your watch progress as the TV plays, and rolls on to the next episode when autoplay is on.
+* The cast panel works as a remote: play/pause, back or forward 10 seconds, seek and volume.
+* On iOS, casting keeps going with the screen locked or while you use other apps, even ones playing sound, and the lock screen and Control Center can control the TV.
+* WebVTT and SRT subtitles show on the TV. (Chromecast doesn't support ASS subtitles.)
+
+Keep the phone on the same Wi-Fi as the TV while casting, because the video goes through it.
+
 ## Download
-Get the app from our [releases page](https://github.com/kodjodevf/mangayomi/releases).
+**iOS with Chromecast casting:** add this fork's source to your sideloading app (below), or get the IPA from this fork's [releases](https://github.com/IStoleThis/chromecast-testing/releases).
+
+**Other platforms:** get the official app from the [Mangayomi releases page](https://github.com/kodjodevf/mangayomi/releases). This fork only publishes iOS builds.
 
 ## iOS Sideloading Sources
-<a href="https://intradeus.github.io/http-protocol-redirector?r=altstore://source?url=https://raw.githubusercontent.com/kodjodevf/mangayomi/refs/heads/main/repo/source.json"><img alt="AltStore Source" src="repo/images/buttons/altstore_button.png" width="150"></a>
+<a href="https://intradeus.github.io/http-protocol-redirector?r=altstore://source?url=https://github.com/IStoleThis/chromecast-testing/releases/latest/download/altstore-source.json"><img alt="AltStore Source" src="repo/images/buttons/altstore_button.png" width="150"></a>
 &nbsp;
-<a href="https://intradeus.github.io/http-protocol-redirector?r=feather://source/https://raw.githubusercontent.com/kodjodevf/mangayomi/refs/heads/main/repo/source.json"><img alt="Feather Source" src="repo/images/buttons/feather_button.png" width="150"></a>
+<a href="https://intradeus.github.io/http-protocol-redirector?r=feather://source/https://github.com/IStoleThis/chromecast-testing/releases/latest/download/altstore-source.json"><img alt="Feather Source" src="repo/images/buttons/feather_button.png" width="150"></a>
 &nbsp;
-<a href="https://intradeus.github.io/http-protocol-redirector?r=sidestore://source?url=https://raw.githubusercontent.com/kodjodevf/mangayomi/refs/heads/main/repo/source.json"><img alt="Sidestore Source" src="repo/images/buttons/sidestore_button.png" width="150"></a>
+<a href="https://intradeus.github.io/http-protocol-redirector?r=sidestore://source?url=https://github.com/IStoleThis/chromecast-testing/releases/latest/download/altstore-source.json"><img alt="Sidestore Source" src="repo/images/buttons/sidestore_button.png" width="150"></a>
 &nbsp;
-<a href="https://raw.githubusercontent.com/kodjodevf/mangayomi/refs/heads/main/repo/source.json"><img alt="Direct URL Source" src="repo/images/buttons/url_button.png" width="150"></a>
+<a href="https://github.com/IStoleThis/chromecast-testing/releases/latest/download/altstore-source.json"><img alt="Direct URL Source" src="repo/images/buttons/url_button.png" width="150"></a>
 
-Note: Only future releases (> 0.5.2) will be signed (and therefore have AltStore/SideStore compatibility).
+Builds from this fork are unsigned. AltStore and SideStore sign them with your Apple ID as they install them (with a free Apple ID, the app has to be refreshed every 7 days); Feather signs them with the certificate you've imported.
 
 # Contributing
 
