@@ -875,6 +875,7 @@ class _AnimeStreamPageState extends riv.ConsumerState<AnimeStreamPage>
     final started = await _cast.start(
       device,
       () => _castMediaFor(prefs!, _currentPosition.value),
+      nowPlaying: _castNowPlaying(),
     );
     if (!started && wasPlaying && mounted) await _player.play();
   }
@@ -892,8 +893,28 @@ class _AnimeStreamPageState extends riv.ConsumerState<AnimeStreamPage>
       isLocal: widget.isLocal,
       headers: prefs.headers,
       title: [?series, ?episodeName].join(' - '),
+      imageUrl: _castCoverUrl(),
       start: start,
       subtitles: video.subtitles,
+    );
+  }
+
+  /// The series cover, for the TV and the lock screen, if it is on the web.
+  String? _castCoverUrl() {
+    final manga = widget.episode.manga.value;
+    for (final url in [manga?.customCoverFromTracker, manga?.imageUrl]) {
+      if (url != null && url.startsWith('http')) return url;
+    }
+    return null;
+  }
+
+  /// What the lock screen shows: the episode, with the series under it.
+  CastNowPlaying _castNowPlaying() {
+    final series = widget.episode.manga.value?.name;
+    return CastNowPlaying(
+      title: widget.episode.name ?? series ?? 'Mangayomi',
+      subtitle: series,
+      artworkUrl: _castCoverUrl(),
     );
   }
 
@@ -903,7 +924,7 @@ class _AnimeStreamPageState extends riv.ConsumerState<AnimeStreamPage>
     try {
       final media = await _castMediaFor(prefs, start);
       if (!mounted || !_cast.isCasting) return;
-      await _cast.load(media);
+      await _cast.load(media, nowPlaying: _castNowPlaying());
     } catch (_) {}
   }
 

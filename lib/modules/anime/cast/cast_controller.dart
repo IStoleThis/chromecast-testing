@@ -1,12 +1,23 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:dart_cast/dart_cast.dart';
 import 'package:flutter/foundation.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import 'cast_discovery.dart';
+import 'cast_keep_alive.dart';
 
 enum CastStatus { idle, searching, connecting, casting }
+
+/// What the lock screen shows while casting.
+class CastNowPlaying {
+  const CastNowPlaying({required this.title, this.subtitle, this.artworkUrl});
+
+  final String title;
+  final String? subtitle;
+  final String? artworkUrl;
+}
 
 /// App-wide Chromecast state.
 ///
@@ -57,6 +68,14 @@ class CastController extends ChangeNotifier {
 
   int _attachedViews = 0;
   Timer? _orphanTimer;
+
+  late final CastKeepAlive _keepAlive = CastKeepAlive(
+    onCommand: _onLockScreenCommand,
+  );
+  CastNowPlaying? _nowPlaying;
+  DateTime _lastSyncAt = DateTime.fromMillisecondsSinceEpoch(0);
+  Duration _lastSyncedPosition = Duration.zero;
+  bool _lastSyncedPlaying = false;
 
   CastStatus get status => _status;
   bool get isCasting => _status == CastStatus.casting;
@@ -171,13 +190,15 @@ class CastController extends ChangeNotifier {
   /// the stream is being inspected, which can take a few seconds.
   Future<bool> start(
     CastDevice device,
-    Future<CastMedia> Function() buildMedia,
-  ) async {
+    Future<CastMedia> Function() buildMedia, {
+    CastNowPlaying? nowPlaying,
+  }) async {
     _orphanTimer?.cancel();
     _stopSearching();
 
     _error = null;
     _device = device;
+    _nowPlaying = nowPlaying;
     _status = CastStatus.connecting;
     notifyListeners();
 
@@ -188,7 +209,7 @@ class CastController extends ChangeNotifier {
       _resetProgress(media);
       await session.loadMedia(media);
       _status = CastStatus.casting;
-      unawaited(WakelockPlus.enable());
+      unawaited(_stayAwake(true));
       notifyListeners();
       return true;
     } catch (error) {
@@ -199,14 +220,16 @@ class CastController extends ChangeNotifier {
 
   /// Switches the TV to [media] on the open session, e.g. for the next
   /// episode or another quality.
-  Future<bool> load(CastMedia media) async {
+  Future<bool> load(CastMedia media, {CastNowPlaying? nowPlaying}) async {
     final session = _session;
     if (session == null) return false;
     try {
+      if (nowPlaying != null) _nowPlaying = nowPlaying;
       _resetProgress(media);
       await session.loadMedia(media);
       _error = null;
       notifyListeners();
+      _syncNowPlaying(force: true);
       return true;
     } catch (error) {
       _error = 'The TV could not play this: $error';
@@ -226,6 +249,7 @@ class CastController extends ChangeNotifier {
     var target = to < Duration.zero ? Duration.zero : to;
     if (total > Duration.zero && target > total) target = total;
     position.value = target;
+    _syncNowPlaying(force: true);
     await _command((s) => s.seek(target));
   }
 
@@ -266,9 +290,15 @@ class CastController extends ChangeNotifier {
         session.positionStream.listen((value) {
           position.value = value;
           if (_sessionState == SessionState.playing) _lastLivePosition = value;
+          _syncNowPlaying();
         }),
       )
-      ..add(session.durationStream.listen((value) => duration.value = value))
+      ..add(
+        session.durationStream.listen((value) {
+          duration.value = value;
+          _syncNowPlaying(force: true);
+        }),
+      )
       ..add(
         session.volumeStream.listen((value) {
           _volume = value;
@@ -304,6 +334,7 @@ class CastController extends ChangeNotifier {
       _finished.add(null);
     }
     notifyListeners();
+    _syncNowPlaying();
   }
 
   bool _endedNearTheEnd() {
@@ -343,7 +374,80 @@ class CastController extends ChangeNotifier {
     _device = null;
     _sessionState = SessionState.disconnected;
     _status = CastStatus.idle;
-    unawaited(WakelockPlus.disable());
+    _nowPlaying = null;
+    unawaited(_stayAwake(false));
     notifyListeners();
+  }
+
+  /// Lets casting carry on with the screen off or another app in front: on
+  /// iOS the app keeps running by playing silence. Elsewhere the screen is
+  /// just kept on (an Android app would need a foreground service instead).
+  Future<void> _stayAwake(bool on) async {
+    try {
+      if (Platform.isIOS) {
+        if (on) {
+          await _keepAlive.start();
+          _syncNowPlaying(force: true);
+        } else {
+          await _keepAlive.stop();
+        }
+      } else {
+        await (on ? WakelockPlus.enable() : WakelockPlus.disable());
+      }
+    } catch (_) {}
+  }
+
+  // ---------------------------------------------------------------------------
+  // Lock screen
+  // ---------------------------------------------------------------------------
+
+  void _onLockScreenCommand(String action, double? value) {
+    final amount = value == null
+        ? null
+        : Duration(milliseconds: (value * 1000).round());
+    switch (action) {
+      case 'play':
+        unawaited(play());
+      case 'pause':
+        unawaited(pause());
+      case 'toggle':
+        unawaited(togglePlayPause());
+      case 'skip':
+        if (amount != null) unawaited(seekBy(amount));
+      case 'seek':
+        if (amount != null) unawaited(seek(amount));
+    }
+  }
+
+  /// Tells the lock screen where the TV is. It moves the time on by itself
+  /// while playing, so this only sends when that would go wrong: a pause or
+  /// play, a seek, a new duration, or every 15 seconds to stay in step.
+  void _syncNowPlaying({bool force = false}) {
+    final info = _nowPlaying;
+    if (info == null || !isCasting) return;
+    final now = DateTime.now();
+    final playing = _sessionState == SessionState.playing;
+    final current = position.value;
+    final expected =
+        _lastSyncedPosition +
+        (_lastSyncedPlaying ? now.difference(_lastSyncAt) : Duration.zero);
+    final unchanged =
+        playing == _lastSyncedPlaying &&
+        (current - expected).abs() < const Duration(seconds: 3) &&
+        now.difference(_lastSyncAt) < const Duration(seconds: 15);
+    if (!force && unchanged) return;
+    _lastSyncAt = now;
+    _lastSyncedPosition = current;
+    _lastSyncedPlaying = playing;
+    unawaited(
+      _keepAlive.update(
+        title: info.title,
+        subtitle: info.subtitle,
+        artworkUrl: info.artworkUrl,
+        position: current,
+        duration: duration.value,
+        playing: playing,
+      ),
+    );
   }
 }

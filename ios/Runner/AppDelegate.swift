@@ -27,6 +27,9 @@ import UniformTypeIdentifiers
   // The screen's brightness before a reader set its own, given back on
   // "reset".
   private var brightnessBeforeReading: CGFloat?
+  // Casting in the background and on the lock screen (CastKeepAlive on the
+  // Dart side).
+  private var castBackgroundAudio: CastBackgroundAudio?
   override func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
@@ -165,6 +168,17 @@ import UniformTypeIdentifiers
       default:
         result(FlutterMethodNotImplemented)
       }
+    })
+
+    let castChannel = FlutterMethodChannel(
+      name: "com.kodjodevf.mangayomi.cast_background",
+      binaryMessenger: messenger
+    )
+    let castAudio = CastBackgroundAudio(channel: castChannel)
+    castBackgroundAudio = castAudio
+    castChannel.setMethodCallHandler({
+      (call: FlutterMethodCall, result: @escaping FlutterResult) -> Void in
+      castAudio.handle(call, result: result)
     })
   }
 
@@ -423,3 +437,257 @@ import UniformTypeIdentifiers
 // scene:willConnectToSession:options: to it, so it picks up both cold-start and
 // warm links itself. The old AppLinks.shared.getLink(launchOptions:) block read
 // launch options that UIScene never populates.
+
+// MARK: - Casting in the background
+
+/// Keeps casting going with the screen off or another app in front, and shows
+/// the cast on the lock screen (CastKeepAlive on the Dart side).
+///
+/// The TV reads the video through a small server inside the app, and iOS
+/// freezes an app soon after it leaves the screen unless it plays audio, so
+/// while casting this plays a loop of silence.
+///
+/// iOS gives the lock-screen controls only to an app whose audio doesn't mix
+/// with other apps', but such audio is cut off as soon as another app (a
+/// video, music) plays sound. So the silence starts unmixed, for the lock
+/// screen; when another app plays something it switches to mixing, so both
+/// keep going; and it takes the lock screen back when the app is opened again
+/// with nothing else playing.
+final class CastBackgroundAudio: NSObject {
+  private let channel: FlutterMethodChannel
+  private var player: AVAudioPlayer?
+  private var mixing = false
+  private var savedCategory: AVAudioSession.Category?
+  private var savedMode: AVAudioSession.Mode = .default
+  private var savedOptions: AVAudioSession.CategoryOptions = []
+  private var commandTargets: [(MPRemoteCommand, Any)] = []
+  private var nowPlaying: [String: Any] = [:]
+  private var artworkUrl: String?
+
+  init(channel: FlutterMethodChannel) {
+    self.channel = channel
+    super.init()
+  }
+
+  func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    switch call.method {
+    case "start":
+      start()
+      result(nil)
+    case "stop":
+      stop()
+      result(nil)
+    case "update":
+      update(call.arguments as? [String: Any] ?? [:])
+      result(nil)
+    default:
+      result(FlutterMethodNotImplemented)
+    }
+  }
+
+  private func start() {
+    guard self.player == nil,
+          let silentPlayer = try? AVAudioPlayer(data: CastBackgroundAudio.silence()) else {
+      return
+    }
+    let session = AVAudioSession.sharedInstance()
+    savedCategory = session.category
+    savedMode = session.mode
+    savedOptions = session.categoryOptions
+    silentPlayer.numberOfLoops = -1
+    self.player = silentPlayer
+    // Something already playing (music, say) is mixed with, not stopped.
+    activate(mixing: session.isOtherAudioPlaying)
+    let center = NotificationCenter.default
+    center.addObserver(
+      self, selector: #selector(audioInterrupted(_:)),
+      name: AVAudioSession.interruptionNotification, object: session)
+    center.addObserver(
+      self, selector: #selector(appBecameActive),
+      name: UIApplication.didBecomeActiveNotification, object: nil)
+    enableCommands()
+  }
+
+  private func stop() {
+    guard let silentPlayer = self.player else { return }
+    NotificationCenter.default.removeObserver(self)
+    silentPlayer.stop()
+    self.player = nil
+    disableCommands()
+    MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+    nowPlaying = [:]
+    artworkUrl = nil
+    let session = AVAudioSession.sharedInstance()
+    try? session.setActive(false, options: .notifyOthersOnDeactivation)
+    if let category = savedCategory {
+      try? session.setCategory(category, mode: savedMode, options: savedOptions)
+      savedCategory = nil
+    }
+  }
+
+  /// Plays the silence, mixed with other apps' audio or, for the lock-screen
+  /// controls, not.
+  private func activate(mixing: Bool) {
+    self.mixing = mixing
+    let session = AVAudioSession.sharedInstance()
+    let options: AVAudioSession.CategoryOptions = mixing ? [.mixWithOthers] : []
+    try? session.setCategory(.playback, mode: .default, options: options)
+    try? session.setActive(true)
+    player?.play()
+    if !mixing {
+      MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlaying.isEmpty ? nil : nowPlaying
+    }
+  }
+
+  @objc private func audioInterrupted(_ notification: Notification) {
+    guard let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+          let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self, self.player != nil else { return }
+      switch type {
+      case .began:
+        // Another app is playing sound: keep going alongside it.
+        self.activate(mixing: true)
+        // If the silence couldn't start again straight away, try once more.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+          guard let self = self, let silentPlayer = self.player, !silentPlayer.isPlaying else {
+            return
+          }
+          self.activate(mixing: true)
+        }
+      case .ended:
+        self.activate(mixing: self.mixing)
+      @unknown default:
+        break
+      }
+    }
+  }
+
+  @objc private func appBecameActive() {
+    // Back in the app with nothing else playing: take the lock screen back.
+    guard player != nil, mixing, !AVAudioSession.sharedInstance().isOtherAudioPlaying else {
+      return
+    }
+    activate(mixing: false)
+  }
+
+  // MARK: Lock screen
+
+  private func update(_ args: [String: Any]) {
+    var info: [String: Any] = [:]
+    if let title = args["title"] as? String {
+      info[MPMediaItemPropertyTitle] = title
+    }
+    if let subtitle = args["subtitle"] as? String {
+      info[MPMediaItemPropertyArtist] = subtitle
+    }
+    if let duration = args["duration"] as? Double, duration > 0 {
+      info[MPMediaItemPropertyPlaybackDuration] = duration
+    }
+    info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = (args["position"] as? Double) ?? 0
+    info[MPNowPlayingInfoPropertyPlaybackRate] = (args["playing"] as? Bool) == true ? 1.0 : 0.0
+    let artwork = args["artwork"] as? String
+    if artwork != nil, artwork == artworkUrl,
+       let existing = nowPlaying[MPMediaItemPropertyArtwork] {
+      info[MPMediaItemPropertyArtwork] = existing
+    }
+    nowPlaying = info
+    if player != nil, !mixing {
+      MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+    if let artwork = artwork, artwork != artworkUrl {
+      artworkUrl = artwork
+      fetchArtwork(artwork)
+    }
+  }
+
+  private func fetchArtwork(_ address: String) {
+    guard let url = URL(string: address) else { return }
+    URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+      guard let data = data, let image = UIImage(data: data) else { return }
+      DispatchQueue.main.async {
+        guard let self = self, self.player != nil, self.artworkUrl == address else { return }
+        self.nowPlaying[MPMediaItemPropertyArtwork] =
+          MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+        if !self.mixing {
+          MPNowPlayingInfoCenter.default().nowPlayingInfo = self.nowPlaying
+        }
+      }
+    }.resume()
+  }
+
+  private func enableCommands() {
+    let center = MPRemoteCommandCenter.shared()
+    center.skipForwardCommand.preferredIntervals = [10]
+    center.skipBackwardCommand.preferredIntervals = [10]
+    addCommand(center.playCommand) { [weak self] _ in
+      self?.send("play") ?? .commandFailed
+    }
+    addCommand(center.pauseCommand) { [weak self] _ in
+      self?.send("pause") ?? .commandFailed
+    }
+    addCommand(center.togglePlayPauseCommand) { [weak self] _ in
+      self?.send("toggle") ?? .commandFailed
+    }
+    addCommand(center.skipForwardCommand) { [weak self] _ in
+      self?.send("skip", 10) ?? .commandFailed
+    }
+    addCommand(center.skipBackwardCommand) { [weak self] _ in
+      self?.send("skip", -10) ?? .commandFailed
+    }
+    addCommand(center.changePlaybackPositionCommand) { [weak self] event in
+      guard let positionEvent = event as? MPChangePlaybackPositionCommandEvent else {
+        return .commandFailed
+      }
+      return self?.send("seek", positionEvent.positionTime) ?? .commandFailed
+    }
+  }
+
+  private func addCommand(
+    _ command: MPRemoteCommand,
+    handler: @escaping (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus
+  ) {
+    command.isEnabled = true
+    commandTargets.append((command, command.addTarget(handler: handler)))
+  }
+
+  private func disableCommands() {
+    for (command, target) in commandTargets {
+      command.removeTarget(target)
+      command.isEnabled = false
+    }
+    commandTargets.removeAll()
+  }
+
+  /// Passes a lock-screen button press to the Dart side, which tells the TV.
+  @discardableResult
+  private func send(_ action: String, _ value: Double? = nil) -> MPRemoteCommandHandlerStatus {
+    var args: [String: Any] = ["action": action]
+    if let value = value {
+      args["value"] = value
+    }
+    channel.invokeMethod("command", arguments: args)
+    return .success
+  }
+
+  /// One second of silence as WAV data (8 kHz, mono, 16-bit), played in a loop.
+  private static func silence() -> Data {
+    let rate = 8000
+    let length = rate * 2
+    var bytes: [UInt8] = []
+    func text(_ value: String) {
+      bytes += Array(value.utf8)
+    }
+    func number(_ value: Int, _ size: Int) {
+      for index in 0..<size {
+        bytes.append(UInt8((value >> (8 * index)) & 0xff))
+      }
+    }
+    text("RIFF"); number(36 + length, 4); text("WAVE")
+    text("fmt "); number(16, 4); number(1, 2); number(1, 2)
+    number(rate, 4); number(rate * 2, 4); number(2, 2); number(16, 2)
+    text("data"); number(length, 4)
+    bytes += [UInt8](repeating: 0, count: length)
+    return Data(bytes)
+  }
+}

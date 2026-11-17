@@ -15,6 +15,7 @@ Future<CastMedia> buildCastMedia({
   required bool isLocal,
   Map<String, String>? headers,
   String? title,
+  String? imageUrl,
   Duration? start,
   List<vid.Track>? subtitles,
 }) async {
@@ -25,6 +26,7 @@ Future<CastMedia> buildCastMedia({
       filePath: url,
       type: _typeFromExtension(url) ?? CastMediaType.mp4,
       title: title,
+      imageUrl: imageUrl,
       startPosition: startPosition,
     );
   }
@@ -36,6 +38,7 @@ Future<CastMedia> buildCastMedia({
     type: type,
     httpHeaders: headers ?? const {},
     title: title,
+    imageUrl: imageUrl,
     startPosition: startPosition,
     subtitles: castSubtitles,
     defaultSubtitle: _defaultSubtitle(castSubtitles),
